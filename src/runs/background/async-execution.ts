@@ -359,6 +359,7 @@ export function buildAsyncRunnerSteps(id: string, params: AsyncRunnerStepBuildPa
 		const primaryModel = resolveSubagentModelOverride(requestedModel, ctx.currentModel, availableModels, ctx.currentModelProvider);
 		const model = applyThinkingSuffix(primaryModel, a.thinking);
 		return {
+			parentSessionId: ctx.currentSessionId,
 			agent: s.agent,
 			task,
 			phase: s.phase,
