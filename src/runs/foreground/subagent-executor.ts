@@ -33,6 +33,7 @@ import {
 import { discoverAvailableSkills, normalizeSkillInput } from "../../agents/skills.ts";
 import { buildAsyncRunnerSteps, executeAsyncChain, executeAsyncSingle, formatAsyncStartedMessage, isAsyncAvailable } from "../background/async-execution.ts";
 import { enqueueChainAppendRequest, readPendingChainAppendRequests, runnerStepOutputNames } from "../background/chain-append.ts";
+import { ChainOutputValidationError, validateChainOutputBindingsWithContext } from "../shared/chain-outputs.ts";
 import { createForkContextResolver } from "../../shared/fork-context.ts";
 import { resolveCurrentSessionId } from "../../shared/session-identity.ts";
 import { applyIntercomBridgeToAgent, INTERCOM_BRIDGE_MARKER, resolveIntercomBridge, resolveIntercomSessionTarget, resolveSubagentIntercomTarget, type IntercomBridgeState } from "../../intercom/intercom-bridge.ts";
@@ -435,21 +436,6 @@ function interruptAsyncRun(state: SubagentState, runId: string | undefined): Age
 	}
 }
 
-function chainStepOutputNames(steps: ChainStep[]): string[] {
-	const names: string[] = [];
-	for (const step of steps) {
-		if (isParallelStep(step)) {
-			names.push(...step.parallel.map((task) => task.as).filter((name): name is string => Boolean(name)));
-		} else if (isDynamicParallelStep(step)) {
-			if (step.collect.as) names.push(step.collect.as);
-		} else {
-			const outputName = (step as SequentialStep).as;
-			if (outputName) names.push(outputName);
-		}
-	}
-	return names;
-}
-
 function duplicateNames(names: string[]): string[] {
 	const seen = new Set<string>();
 	const duplicates = new Set<string>();
@@ -535,10 +521,21 @@ function appendStepToAsyncChain(input: {
 		};
 	}
 
-	const existingDuplicateOutputs = chainStepOutputNames(input.params.chain).filter((name) => Object.hasOwn(status.outputs ?? {}, name));
-	if (existingDuplicateOutputs.length > 0) {
+	const pendingAppendRequests = readPendingChainAppendRequests(resolved.location.asyncDir);
+	const reservedOutputNames = new Set<string>([
+		...Object.keys(status.outputs ?? {}),
+		...(status.steps ?? []).map((step) => step.outputName).filter((name): name is string => Boolean(name)),
+		...pendingAppendRequests.flatMap((request) => runnerStepOutputNames(request.steps)),
+	]);
+	try {
+		validateChainOutputBindingsWithContext(input.params.chain, { maxItems: input.deps.config.chain?.dynamicFanout?.maxItems }, {
+			priorOutputNames: reservedOutputNames,
+			startStepIndex: status.chainStepCount ?? status.steps?.length ?? 0,
+		});
+	} catch (error) {
+		if (!(error instanceof ChainOutputValidationError)) throw error;
 		return {
-			content: [{ type: "text", text: `Cannot append step to run '${resolved.id}': output name already exists: ${existingDuplicateOutputs.join(", ")}.` }],
+			content: [{ type: "text", text: `Cannot append step to run '${resolved.id}': ${error.message}` }],
 			isError: true,
 			details: { mode: "management", results: [] },
 		};
@@ -585,7 +582,7 @@ function appendStepToAsyncChain(input: {
 			details: { mode: "management", results: [] },
 		};
 	}
-	const pendingOutputNames = new Set(readPendingChainAppendRequests(resolved.location.asyncDir).flatMap((request) => runnerStepOutputNames(request.steps)));
+	const pendingOutputNames = new Set(pendingAppendRequests.flatMap((request) => runnerStepOutputNames(request.steps)));
 	const pendingDuplicateOutputs = appendedOutputNames.filter((name) => pendingOutputNames.has(name));
 	if (pendingDuplicateOutputs.length > 0) {
 		return {
