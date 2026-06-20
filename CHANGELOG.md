@@ -14,6 +14,7 @@
 - Reject appended chain steps with duplicate reserved output names or unknown named-output references before they are queued.
 - Ignore legacy `.agents/skills` files during agent discovery so skill definitions are not registered as subagents. Thanks to chyax98 (@chyax98) for #257.
 - Launch detached async runners through Node when Pi itself is not the Node executable. Thanks to Tetsuya.dev (@tetsuya-dev-jp) for #273.
+- Preserve the slash command requester context when bridge requests launch subagents. Thanks to Victor Sumner (@vsumner) for #268.
 
 ## [0.29.0] - 2026-06-19
 
