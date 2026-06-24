@@ -28,6 +28,7 @@ interface RegisterSlashCommandsModule {
 			): void;
 			registerShortcut(key: string, spec: { handler(ctx: unknown): Promise<void> }): void;
 			sendMessage(message: unknown): void;
+			setModel?(model: unknown): Promise<boolean>;
 		},
 		state: {
 			baseCwd: string;
@@ -124,10 +125,11 @@ function createCommandContext(
 		hasUI: boolean;
 		custom: (...args: unknown[]) => Promise<unknown>;
 		notify: (message: string, type?: string) => void;
+		confirm: (title: string, message: string) => Promise<boolean>;
 		setStatus: (key: string, text: string | undefined) => void;
 		setToolsExpanded: (expanded: boolean) => void;
 		sessionManager: unknown;
-		modelRegistry: { getAvailable: () => Array<{ provider: string; id: string }> };
+		modelRegistry: { getAvailable: () => Array<{ provider: string; id: string }>; find?: (provider: string, id: string) => unknown };
 	}> = {},
 ) {
 	return {
@@ -135,12 +137,13 @@ function createCommandContext(
 		hasUI: overrides.hasUI ?? false,
 		ui: {
 			notify: overrides.notify ?? ((_message: string) => {}),
+			confirm: overrides.confirm ?? (async () => false),
 			setStatus: overrides.setStatus ?? ((_key: string, _text: string | undefined) => {}),
 			setToolsExpanded: overrides.setToolsExpanded ?? ((_expanded: boolean) => {}),
 			onTerminalInput: () => () => {},
 			custom: overrides.custom ?? (async () => undefined),
 		},
-		modelRegistry: overrides.modelRegistry ?? { getAvailable: () => [] },
+		modelRegistry: overrides.modelRegistry ?? { getAvailable: () => [], find: () => undefined },
 		sessionManager: overrides.sessionManager ?? {
 			getSessionFile: () => null,
 			getSessionId: () => "session-test",
@@ -893,7 +896,10 @@ describe("subagent profiles slash commands", { skip: !available ? "slash-command
 			const profilesDir = path.join(process.env.HOME!, ".pi", "agent", "profiles", "pi-subagents");
 			fs.mkdirSync(profilesDir, { recursive: true });
 			fs.writeFileSync(path.join(profilesDir, "openai-codex.quota.json"), JSON.stringify({
-				subagents: { agentOverrides: { scout: { model: "openai-codex/gpt-5.3-codex-spark" } } },
+				subagents: { agentOverrides: {
+					scout: { model: "openai-codex/gpt-5.3-codex-spark" },
+					worker: { model: "openai-codex/gpt-5.4" },
+				} },
 			}, null, 2));
 			const sent: unknown[] = [];
 			const commands = new Map<string, RegisteredSlashCommand>();
@@ -907,7 +913,39 @@ describe("subagent profiles slash commands", { skip: !available ? "slash-command
 			await commands.get("subagents-load-profile")!.handler("openai-codex.quota", createCommandContext());
 			const settings = JSON.parse(fs.readFileSync(path.join(process.env.HOME!, ".pi", "agent", "settings.json"), "utf-8"));
 			assert.equal(settings.subagents.agentOverrides.scout.model, "openai-codex/gpt-5.3-codex-spark");
-			assert.match(String((sent[0] as { content?: unknown }).content ?? ""), /run \/reload/);
+			assert.equal(settings.subagents.agentOverrides.worker.model, "openai-codex/gpt-5.4");
+			assert.doesNotMatch(String((sent[0] as { content?: unknown }).content ?? ""), /run \/reload/);
+		});
+	});
+
+	it("can switch the current session model to the loaded profile worker model", async () => {
+		await withIsolatedHome(async () => {
+			const profilesDir = path.join(process.env.HOME!, ".pi", "agent", "profiles", "pi-subagents");
+			fs.mkdirSync(profilesDir, { recursive: true });
+			fs.writeFileSync(path.join(profilesDir, "openai-codex.quota.json"), JSON.stringify({
+				subagents: { agentOverrides: { worker: { model: "openai-codex/gpt-5.4" } } },
+			}, null, 2));
+			const sent: unknown[] = [];
+			const commands = new Map<string, RegisteredSlashCommand>();
+			let setModelArg: unknown;
+			const resolvedModel = { provider: "openai-codex", id: "gpt-5.4" };
+			const pi = {
+				events: createEventBus(),
+				async setModel(model: unknown) { setModelArg = model; return true; },
+				registerCommand(name: string, spec: RegisteredSlashCommand) { commands.set(name, spec); },
+				registerShortcut() {},
+				sendMessage(message: unknown) { sent.push(message); },
+			};
+			registerSlashCommands!(pi as never, createState(process.cwd()));
+			await commands.get("subagents-load-profile")!.handler("openai-codex.quota", createCommandContext({
+				confirm: async () => true,
+				modelRegistry: {
+					getAvailable: () => [{ provider: "openai-codex", id: "gpt-5.4" }],
+					find: (provider, id) => provider === "openai-codex" && id === "gpt-5.4" ? resolvedModel : undefined,
+				},
+			}) as never);
+			assert.equal(setModelArg, resolvedModel);
+			assert.match(String((sent[0] as { content?: unknown }).content ?? ""), /Current session model switched to: openai-codex\/gpt-5.4/);
 		});
 	});
 

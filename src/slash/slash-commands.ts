@@ -10,6 +10,7 @@ import {
 	checkSubagentProfile,
 	generateProfilesForProvider,
 	listSubagentProfiles,
+	readSubagentProfile,
 	refreshProviderModelCatalog,
 } from "../profiles/profiles.ts";
 import type { SubagentParamsLike } from "../runs/foreground/subagent-executor.ts";
@@ -175,6 +176,11 @@ function parseSingleRequiredArg(args: string, usage: string): { ok: true; value:
 	const parts = args.trim().split(/\s+/).filter(Boolean);
 	if (parts.length !== 1) return { ok: false, message: usage };
 	return { ok: true, value: parts[0]! };
+}
+
+function getProfileWorkerModel(profile: { subagents?: { agentOverrides?: Record<string, { model?: string }> } }): string | undefined {
+	const model = profile.subagents?.agentOverrides?.worker?.model;
+	return typeof model === "string" && model.trim() ? model.trim() : undefined;
 }
 
 function loadSavedOutputSchema(chain: ChainConfig, stepAgent: string, outputSchema: unknown): JsonSchemaObject | undefined {
@@ -666,13 +672,38 @@ export function registerSlashCommands(
 			}
 			try {
 				await withSlashStatus(ctx, `Loading profile ${parsed.value}…`, async () => {
+					const { profile } = readSubagentProfile(parsed.value);
+					const workerModel = getProfileWorkerModel(profile);
 					const result = applySubagentProfile(parsed.value);
-					sendSlashText(pi, [
+					const lines = [
 						`Loaded subagent profile: ${parsed.value}`,
 						`Profile: ${result.filePath}`,
 						`Updated: ${result.settingsPath}`,
-						"Next: run /reload to apply it in the current session",
-					].join("\n"));
+					];
+
+					if (workerModel && typeof pi.setModel === "function" && typeof ctx.modelRegistry?.find === "function") {
+						const shouldSwitch = await ctx.ui.confirm(
+							"",
+							`Profile loaded. Also switch this session to the profile worker model?\n\n${workerModel}`,
+						);
+						if (shouldSwitch) {
+							const slash = workerModel.indexOf("/");
+							const provider = slash === -1 ? "" : workerModel.slice(0, slash);
+							const id = slash === -1 ? workerModel : workerModel.slice(slash + 1);
+							const model = provider && id ? ctx.modelRegistry.find(provider, id) : undefined;
+							if (!model) {
+								lines.push(`Could not switch current session model: '${workerModel}' is not available in the current model registry.`);
+							} else {
+								const success = await pi.setModel(model);
+								if (success) lines.push(`Current session model switched to: ${workerModel}`);
+								else lines.push(`Could not switch current session model to '${workerModel}': no API key or provider access is available.`);
+							}
+						}
+					} else if (workerModel) {
+						lines.push(`Profile worker model: ${workerModel}`);
+					}
+
+					sendSlashText(pi, lines.join("\n"));
 				});
 			} catch (error) {
 				ctx.ui.notify(error instanceof Error ? error.message : String(error), "error");
