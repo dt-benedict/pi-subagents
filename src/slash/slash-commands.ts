@@ -567,7 +567,7 @@ export function parseChainExpression(input: string): { steps: ParsedGroupStep[] 
 			steps.push(parseGroupSegment(t));
 			continue;
 		}
-		if (t.includes("(") || t.includes(")")) {
+		if (findUnmatchedCloseParen(t)) {
 			throw new SlashParseError(`Unmatched parentheses in chain segment: '${t}'`);
 		}
 		steps.push(parseSingleTaskToken(t));

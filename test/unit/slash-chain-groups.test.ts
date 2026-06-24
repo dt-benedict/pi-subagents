@@ -214,6 +214,21 @@ describe("parseChainExpression", () => {
 			"scan -> quick",
 		);
 	});
+
+	it("allows balanced parens in a -- task after a group", () => {
+		const expression = parseChainExpression(
+			'scout "scan" -> (reviewer "A" | reviewer "B") -> writer -- fix (backend)',
+		);
+		assert.equal(expression.steps.length, 3);
+	});
+
+	it("still rejects truly unmatched parens in a non-group segment", () => {
+		assert.throws(
+			() => parseChainExpression('scout "scan" -> (reviewer "A" | reviewer "B") -> writer -- fix (backend'),
+			(error: unknown) =>
+				error instanceof SlashParseError && error.message.includes("Unmatched parentheses"),
+		);
+	});
 });
 
 describe("buildChainExpressionSteps", () => {
@@ -413,6 +428,20 @@ describe("buildChainExpressionSteps", () => {
 			built.chain[0] && "task" in built.chain[0] ? built.chain[0].task : undefined,
 			"inspect auth (backend)",
 		);
+	});
+
+	it("allows balanced parens in a -- task after a group step", () => {
+		const notifications: string[] = [];
+		const built = buildChainExpressionSteps(
+			makeState(tempRoot) as never,
+			'scout "scan" -> (reviewer "A" | reviewer "B") -> writer -- fix (backend)',
+			makeCtx(notifications) as never,
+		);
+		assert.ok(built);
+		if (!built) return;
+		assert.deepEqual(notifications, []);
+		assert.equal(built.chain.length, 3);
+		assert.equal(built.task, "scan");
 	});
 
 	it("exports a stable parallel group usage hint", () => {
