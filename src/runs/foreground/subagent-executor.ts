@@ -40,7 +40,7 @@ import { resolveCurrentSessionId } from "../../shared/session-identity.ts";
 import { applyIntercomBridgeToAgent, INTERCOM_BRIDGE_MARKER, resolveIntercomBridge, resolveIntercomSessionTarget, resolveSubagentIntercomTarget, type IntercomBridgeState } from "../../intercom/intercom-bridge.ts";
 import { formatControlIntercomMessage, formatControlNoticeMessage, resolveControlConfig, shouldNotifyControlEvent } from "../shared/subagent-control.ts";
 import { finalizeSingleOutput, injectSingleOutputInstruction, normalizeSingleOutputOverride, resolveSingleOutputPath, validateFileOnlyOutputMode } from "../shared/single-output.ts";
-import { compactForegroundDetails, getSingleResultOutput, mapConcurrent, readStatus, resolveChildCwd, sumResultsCost } from "../../shared/utils.ts";
+import { compactForegroundDetails, getSingleResultOutput, mapConcurrent, readStatus, resolveChildCwd, sumResultsCost, sumResultsUsage } from "../../shared/utils.ts";
 import { DEFAULT_GLOBAL_CONCURRENCY_LIMIT, Semaphore } from "../shared/parallel-utils.ts";
 import {
 	attachNestedChildrenToResultChildren,
@@ -55,7 +55,7 @@ import { buildRevivedAsyncTask, interruptLiveAsyncResumeTarget, resolveAsyncResu
 import { deliverInterruptRequest } from "../background/control-channel.ts";
 import { reconcileAsyncRun } from "../background/stale-run-reconciler.ts";
 import { resolveAsyncRootResultPath } from "../background/chain-root-attachment.ts";
-import { createNestedRoute, readNestedControlResults, resolveInheritedNestedRouteFromEnv, resolveNestedAsyncDir, resolveNestedParentAddressFromEnv, updateForegroundNestedProjection, writeNestedControlRequest, writeNestedEvent, type NestedRunResolutionScope } from "../shared/nested-events.ts";
+import { attachRootChildrenToSteps, createNestedRoute, readNestedControlResults, resolveInheritedNestedRouteFromEnv, resolveNestedAsyncDir, resolveNestedParentAddressFromEnv, updateForegroundNestedProjection, writeNestedControlRequest, writeNestedEvent, type NestedRunResolutionScope } from "../shared/nested-events.ts";
 import { resolveSubagentRunId, type ResolvedSubagentRunId } from "../background/run-id-resolver.ts";
 import { formatNestedRunStatusLines } from "../shared/nested-render.ts";
 import { inspectSubagentStatus } from "../background/run-status.ts";
@@ -1785,8 +1785,13 @@ async function runChainPath(data: ExecutionContextData, deps: ExecutorDeps): Pro
 		});
 	}
 
-	const chainDetails = chainResult.details ? compactForegroundDetails({ ...chainResult.details, runId }) : undefined;
-	if (foregroundControl) updateForegroundNestedProjection(foregroundControl);
+	const rawChainDetails = chainResult.details ? { ...chainResult.details, runId } : undefined;
+	if (foregroundControl && rawChainDetails) {
+		updateForegroundNestedProjection(foregroundControl);
+		attachRootChildrenToSteps(runId, rawChainDetails.results, foregroundControl.nestedChildren);
+		rawChainDetails.totalCost = sumResultsCost(rawChainDetails.results);
+	}
+	const chainDetails = rawChainDetails ? compactForegroundDetails(rawChainDetails) : undefined;
 	if (chainDetails) rememberForegroundRun(deps.state, { runId, mode: "chain", cwd: effectiveCwd, results: chainDetails.results });
 	const intercomReceipt = chainDetails && !chainDetails.results.some((result) => result.interrupted || result.detached)
 		? await maybeBuildForegroundIntercomReceipt({
@@ -2323,6 +2328,10 @@ async function runParallelPath(data: ExecutionContextData, deps: ExecutorDeps): 
 			if (result.artifactPaths) allArtifactPaths.push(result.artifactPaths);
 		}
 
+		if (foregroundControl) {
+			updateForegroundNestedProjection(foregroundControl);
+			attachRootChildrenToSteps(runId, results, foregroundControl.nestedChildren);
+		}
 		const interrupted = results.find((result) => result.interrupted);
 		const details = compactForegroundDetails({
 			mode: "parallel",
@@ -2330,6 +2339,7 @@ async function runParallelPath(data: ExecutionContextData, deps: ExecutorDeps): 
 			results,
 			progress: params.includeProgress ? allProgress : undefined,
 			artifacts: allArtifactPaths.length ? { dir: artifactsDir, files: allArtifactPaths } : undefined,
+			totalChildUsage: sumResultsUsage(results),
 			totalCost: sumResultsCost(results),
 		});
 		rememberForegroundRun(deps.state, { runId, mode: "parallel", cwd: effectiveCwd, results: details.results });
@@ -2633,6 +2643,10 @@ async function runSinglePath(data: ExecutionContextData, deps: ExecutorDeps): Pr
 		outputReference: r.outputReference,
 		saveError: r.outputSaveError,
 	});
+	if (foregroundControl) {
+		updateForegroundNestedProjection(foregroundControl);
+		attachRootChildrenToSteps(runId, [r], foregroundControl.nestedChildren);
+	}
 	const details = compactForegroundDetails({
 		mode: "single",
 		runId,
@@ -2640,6 +2654,7 @@ async function runSinglePath(data: ExecutionContextData, deps: ExecutorDeps): Pr
 		progress: params.includeProgress ? allProgress : undefined,
 		artifacts: allArtifactPaths.length ? { dir: artifactsDir, files: allArtifactPaths } : undefined,
 		truncation: r.truncation,
+		totalChildUsage: sumResultsUsage([r]),
 		totalCost: sumResultsCost([r]),
 	});
 	rememberForegroundRun(deps.state, { runId, mode: "single", cwd: effectiveCwd, results: details.results });
@@ -3084,6 +3099,7 @@ export function createSubagentExecutor(deps: ExecutorDeps): {
 						startedAt: foregroundControl?.startedAt ?? now,
 						...(state !== "running" ? { endedAt: now } : {}),
 						lastUpdate: now,
+						...(details?.totalCost ? { totalCost: details.totalCost } : {}),
 						...(errorText ? { error: errorText } : {}),
 						...(details?.results.length ? { steps: details.results.map((child) => ({
 							agent: child.agent,

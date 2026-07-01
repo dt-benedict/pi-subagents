@@ -3,13 +3,15 @@
 ## [Unreleased]
 
 ### Added
+- Added `/subagent-cost` and `totalChildUsage` run details so parent sessions can inspect aggregate subagent child usage and cost. Thanks to Aaron Ky-Riesenbach (@aaronkyriesenbach) for #343.
 - Added configurable companion package recommendations for `pi-intercom` and `pi-prompt-template-model`, surfaced in session-start transcript messages, `subagent({ action: "list" })`, and `/subagents-doctor`, with `/subagents-companions` hide/show/status controls.
 - Added detached async runner stdout and stderr log files. Thanks to Daniel Mateos Carballares (@danim47c) for #358.
-- Added `totalCost` rollups to foreground single, parallel, and chain run details. Thanks to Clark Everson (@gr3enarr0w) for #348.
+- Added `totalCost` rollups to foreground single, parallel, and chain run details, including nested foreground subagent costs and compact progress display. Thanks to Clark Everson (@gr3enarr0w) for #345.
 - Added `globalConcurrencyLimit` to cap simultaneously running subagent tasks across parallel groups in a single run. Thanks to Clark Everson (@gr3enarr0w) for #349.
 - Added `PI_SUBAGENT_PI_BINARY` to let wrappers launch child agents through an explicit Pi binary instead of resolving `pi` from `PATH`. Thanks to David Barroso (@dbarrosop) for #341.
 
 ### Fixed
+- Recursively interrupt active async parallel children and nested async descendants when pausing a background run. Thanks to Vicary (@vicary) for #355.
 - Avoid runtime peer imports from detached async runners while still forwarding the Pi package root when available. Thanks to @aurbina83 for #352 and @huangkun3251 for #342.
 - Fall back to PATH `node` for async runners when the current Node executable path is stale or deleted. Thanks to Richard Hao (@0xRichardH) for #347.
 - Retry fallback models when a zero-exit subagent attempt produces no output, including background async runs, preserve structured-output-only completions, and pre-warm forked session files for parallel children. Thanks to Clark Everson (@gr3enarr0w) for #344.

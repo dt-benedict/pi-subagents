@@ -7,7 +7,7 @@ import * as os from "node:os";
 import * as path from "node:path";
 import type { Message } from "@earendil-works/pi-ai";
 import { formatToolCall } from "./formatters.ts";
-import type { AgentProgress, AsyncStatus, Details, DisplayItem, ErrorInfo, SingleResult, ToolCallSummary } from "./types.ts";
+import type { AgentProgress, AsyncStatus, Details, DisplayItem, ErrorInfo, NestedRunSummary, SingleResult, ToolCallSummary, Usage } from "./types.ts";
 
 // ============================================================================
 // File System Utilities
@@ -316,21 +316,42 @@ function extractToolCallSummaries(messages: Message[] | undefined): ToolCallSumm
 	return summaries;
 }
 
-/**
- * Sum input tokens, output tokens, and cost across a set of SingleResults.
- * Returns undefined if all results have zero usage (avoids polluting output for no-op runs).
- */
-export function sumResultsCost(results: SingleResult[]): Details["totalCost"] {
-	let inputTokens = 0;
-	let outputTokens = 0;
-	let costUsd = 0;
+export function sumResultsUsage(results: SingleResult[]): Usage {
+	const usage: Usage = { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, cost: 0, turns: 0 };
 	for (const result of results) {
-		inputTokens += result.usage.input;
-		outputTokens += result.usage.output;
-		costUsd += result.usage.cost;
+		usage.input += result.usage.input;
+		usage.output += result.usage.output;
+		usage.cacheRead += result.usage.cacheRead;
+		usage.cacheWrite += result.usage.cacheWrite;
+		usage.cost += result.usage.cost;
+		usage.turns += result.usage.turns;
 	}
-	if (inputTokens === 0 && outputTokens === 0 && costUsd === 0) return undefined;
-	return { inputTokens, outputTokens, costUsd };
+	return usage;
+}
+
+function addNestedCost(total: NonNullable<Details["totalCost"]>, children: NestedRunSummary[] | undefined): void {
+	for (const child of children ?? []) {
+		if (child.totalCost) {
+			total.inputTokens += child.totalCost.inputTokens;
+			total.outputTokens += child.totalCost.outputTokens;
+			total.costUsd += child.totalCost.costUsd;
+			continue;
+		}
+		addNestedCost(total, child.children);
+		for (const step of child.steps ?? []) addNestedCost(total, step.children);
+	}
+}
+
+/** Sum input tokens, output tokens, and cost across a set of SingleResults. */
+export function sumResultsCost(results: SingleResult[]): NonNullable<Details["totalCost"]> {
+	const total = { inputTokens: 0, outputTokens: 0, costUsd: 0 };
+	for (const result of results) {
+		total.inputTokens += result.usage.input;
+		total.outputTokens += result.usage.output;
+		total.costUsd += result.usage.cost;
+		addNestedCost(total, result.children);
+	}
+	return total;
 }
 
 export function compactForegroundResult(result: SingleResult): SingleResult {

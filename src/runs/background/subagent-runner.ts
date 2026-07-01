@@ -4,7 +4,7 @@ import * as path from "node:path";
 import { pathToFileURL } from "node:url";
 import type { Message } from "@earendil-works/pi-ai";
 import { writeAtomicJson } from "../../shared/atomic-json.ts";
-import { consumeInterruptRequest, watchAsyncControlInbox } from "./control-channel.ts";
+import { consumeInterruptRequest, deliverInterruptRequest, watchAsyncControlInbox } from "./control-channel.ts";
 import { appendJsonl as appendRawJsonl, getArtifactPaths } from "../../shared/artifacts.ts";
 import { PI_CODING_AGENT_PACKAGE, getPiSpawnCommand, resolveInstalledPiPackageRoot } from "../shared/pi-spawn.ts";
 import { captureSingleOutputSnapshot, finalizeSingleOutput, formatSavedOutputReference, resolveSingleOutput, type SingleOutputSnapshot } from "../shared/single-output.ts";
@@ -17,6 +17,7 @@ import {
 	type ChainOutputMap,
 	type ModelAttempt,
 	type NestedRouteInfo,
+	type NestedRunSummary,
 	type ResolvedControlConfig,
 	type SubagentRunMode,
 	type Usage,
@@ -50,7 +51,7 @@ import { buildPiArgs, cleanupTempDir } from "../shared/pi-args.ts";
 import { outputEntryFromAsyncResult, resolveOutputReferences } from "../shared/chain-outputs.ts";
 import { createStructuredOutputRuntime, readStructuredOutput } from "../shared/structured-output.ts";
 import { collectDynamicResults, DynamicFanoutError, materializeDynamicParallelStep, validateDynamicCollection } from "../shared/dynamic-fanout.ts";
-import { nestedSummaryFromAsyncStatus, writeNestedEvent } from "../shared/nested-events.ts";
+import { nestedSummaryFromAsyncStatus, projectNestedEvents, resolveNestedAsyncDir, writeNestedEvent } from "../shared/nested-events.ts";
 import { formatModelAttemptNote, isRetryableModelFailure } from "../shared/model-fallback.ts";
 import { attachPostExitStdioGuard, trySignalChild } from "../../shared/post-exit-stdio-guard.ts";
 import { detectSubagentError, extractTextFromContent, extractToolArgsPreview, getFinalOutput } from "../../shared/utils.ts";
@@ -122,6 +123,7 @@ interface StepResult {
 	success: boolean;
 	exitCode?: number | null;
 	skipped?: boolean;
+	interrupted?: boolean;
 	sessionFile?: string;
 	intercomTarget?: string;
 	model?: string;
@@ -1068,6 +1070,8 @@ function ensureParallelProgressFile(cwd: string, group: Extract<RunnerStep, { pa
 	writeInitialProgressFile(cwd);
 }
 
+type SingleStepResult = Awaited<ReturnType<typeof runSingleStep>>;
+
 async function runSubagent(config: SubagentRunConfig): Promise<void> {
 	const { id, steps, resultPath, cwd, placeholder, taskIndex, totalTasks, maxOutput, artifactsDir, artifactConfig } =
 		config;
@@ -1082,7 +1086,7 @@ async function runSubagent(config: SubagentRunConfig): Promise<void> {
 	const eventsPath = path.join(asyncDir, "events.jsonl");
 	const logPath = path.join(asyncDir, `subagent-log-${id}.md`);
 	const controlConfig = config.controlConfig ?? DEFAULT_CONTROL_CONFIG;
-	let activeChildInterrupt: (() => void) | undefined;
+	const activeChildInterrupts = new Map<number, () => void>();
 	let interrupted = false;
 	let currentActivityState: ActivityState | undefined;
 	let activityTimer: NodeJS.Timeout | undefined;
@@ -1229,6 +1233,61 @@ async function runSubagent(config: SubagentRunConfig): Promise<void> {
 		writeAtomicJson(statusPath, statusPayload);
 		emitNestedSelfEvent(statusPayload.state === "running" || statusPayload.state === "queued" ? "subagent.nested.updated" : "subagent.nested.completed");
 	};
+	const registerStepInterrupt = (flatIndex: number, interrupt: (() => void) | undefined): void => {
+		if (!interrupt) {
+			activeChildInterrupts.delete(flatIndex);
+			return;
+		}
+		activeChildInterrupts.set(flatIndex, interrupt);
+		if (interrupted) interrupt();
+	};
+	const interruptActiveChildren = (): void => {
+		for (const interrupt of [...activeChildInterrupts.values()]) interrupt();
+	};
+	const nestedRuns = function* (children: NestedRunSummary[] | undefined): Generator<NestedRunSummary> {
+		for (const child of children ?? []) {
+			yield child;
+			yield* nestedRuns(child.children);
+			yield* nestedRuns(child.steps?.flatMap((step) => step.children ?? []));
+		}
+	};
+	const interruptNestedAsyncDescendants = (): void => {
+		if (!config.nestedRoute) return;
+		let registry: ReturnType<typeof projectNestedEvents>;
+		try {
+			registry = projectNestedEvents(config.nestedRoute);
+		} catch (error) {
+			appendJsonl(eventsPath, JSON.stringify({
+				type: "subagent.nested.interrupt_failed",
+				ts: Date.now(),
+				runId: id,
+				message: error instanceof Error ? error.message : String(error),
+			}));
+			return;
+		}
+		for (const run of nestedRuns(registry.children)) {
+			if (run.state !== "running" && run.state !== "queued") continue;
+			const nestedAsyncDir = run.asyncDir ?? resolveNestedAsyncDir(config.nestedRoute.rootRunId, run);
+			if (!nestedAsyncDir) continue;
+			try {
+				deliverInterruptRequest({ asyncDir: nestedAsyncDir, pid: run.pid, source: "ancestor-interrupt" });
+			} catch (error) {
+				appendJsonl(eventsPath, JSON.stringify({
+					type: "subagent.nested.interrupt_failed",
+					ts: Date.now(),
+					runId: id,
+					targetRunId: run.id,
+					message: error instanceof Error ? error.message : String(error),
+				}));
+			}
+		}
+	};
+	const pausedStepResult = (agent: string): SingleStepResult => ({
+		agent,
+		output: "Paused after interrupt. Waiting for explicit next action.",
+		exitCode: 0,
+		interrupted: true,
+	});
 	const consumePendingAppendRequests = (): void => {
 		if (statusPayload.mode !== "chain" || statusPayload.state !== "running") return;
 		const requests = consumeChainAppendRequests(asyncDir);
@@ -1544,7 +1603,8 @@ async function runSubagent(config: SubagentRunConfig): Promise<void> {
 			ts: now,
 			runId: id,
 		}));
-		activeChildInterrupt?.();
+		interruptNestedAsyncDescendants();
+		interruptActiveChildren();
 	};
 	process.on(ASYNC_INTERRUPT_SIGNAL, interruptRunner);
 	// Portable control inbox: the parent drops an interrupt request file here when
@@ -1723,6 +1783,7 @@ async function runSubagent(config: SubagentRunConfig): Promise<void> {
 			let aborted = false;
 			const parallelResults = await mapConcurrent(dynamicSteps, concurrency, async (task, taskIdx) => {
 				const fi = groupStartFlatIndex + taskIdx;
+				if (interrupted) return pausedStepResult(task.agent);
 				if (aborted && failFast) {
 					const skippedAt = Date.now();
 					statusPayload.steps[fi].status = "failed";
@@ -1760,17 +1821,16 @@ async function runSubagent(config: SubagentRunConfig): Promise<void> {
 					childIntercomTarget: config.childIntercomTargets?.[fi],
 					orchestratorIntercomTarget: config.controlIntercomTarget,
 					nestedRoute: config.nestedRoute,
-					registerInterrupt: (interrupt) => {
-						activeChildInterrupt = interrupt;
-					},
+					registerInterrupt: (interrupt) => registerStepInterrupt(fi, interrupt),
 					onAttemptStart: (attempt) => updateStepModel(fi, attempt.model, attempt.thinking),
 					onChildEvent: (event) => updateStepFromChildEvent(fi, event),
 				});
 				const taskEndTime = Date.now();
-				statusPayload.steps[fi].status = singleResult.exitCode === 0 ? "complete" : "failed";
+				const childInterrupted = singleResult.interrupted === true;
+				statusPayload.steps[fi].status = childInterrupted ? "paused" : singleResult.exitCode === 0 ? "complete" : "failed";
 				statusPayload.steps[fi].endedAt = taskEndTime;
 				statusPayload.steps[fi].durationMs = taskEndTime - taskStartTime;
-				statusPayload.steps[fi].exitCode = singleResult.exitCode;
+				statusPayload.steps[fi].exitCode = childInterrupted ? 0 : singleResult.exitCode;
 				statusPayload.steps[fi].model = singleResult.model;
 				statusPayload.steps[fi].thinking = resolveEffectiveThinking(singleResult.model, statusPayload.steps[fi].thinking);
 				statusPayload.steps[fi].attemptedModels = singleResult.attemptedModels;
@@ -1783,9 +1843,9 @@ async function runSubagent(config: SubagentRunConfig): Promise<void> {
 				statusPayload.lastUpdate = taskEndTime;
 				writeStatusPayload();
 				appendJsonl(eventsPath, JSON.stringify({
-					type: singleResult.exitCode === 0 ? "subagent.step.completed" : "subagent.step.failed",
+					type: childInterrupted ? "subagent.step.paused" : singleResult.exitCode === 0 ? "subagent.step.completed" : "subagent.step.failed",
 					ts: taskEndTime, runId: id, stepIndex: fi, agent: task.agent,
-					exitCode: singleResult.exitCode, durationMs: taskEndTime - taskStartTime,
+					exitCode: childInterrupted ? 0 : singleResult.exitCode, durationMs: taskEndTime - taskStartTime,
 				}));
 				if (singleResult.exitCode !== 0 && failFast) aborted = true;
 				return { ...singleResult, skipped: false };
@@ -1797,9 +1857,10 @@ async function runSubagent(config: SubagentRunConfig): Promise<void> {
 					agent: pr.agent,
 					output: pr.output,
 					error: pr.error,
-					success: pr.exitCode === 0,
-					exitCode: pr.exitCode,
+					success: pr.interrupted !== true && pr.exitCode === 0,
+					exitCode: pr.interrupted === true ? 0 : pr.exitCode,
 					skipped: pr.skipped,
+					interrupted: pr.interrupted,
 					sessionFile: pr.sessionFile,
 					intercomTarget: pr.intercomTarget,
 					model: pr.model,
@@ -1954,6 +2015,7 @@ async function runSubagent(config: SubagentRunConfig): Promise<void> {
 					concurrency,
 					async (task, taskIdx) => {
 						const fi = groupStartFlatIndex + taskIdx;
+						if (interrupted) return pausedStepResult(task.agent);
 						if (aborted && failFast) {
 							const skippedAt = Date.now();
 							statusPayload.steps[fi].status = "failed";
@@ -2007,9 +2069,7 @@ async function runSubagent(config: SubagentRunConfig): Promise<void> {
 							childIntercomTarget: config.childIntercomTargets?.[fi],
 							orchestratorIntercomTarget: config.controlIntercomTarget,
 							nestedRoute: config.nestedRoute,
-							registerInterrupt: (interrupt) => {
-								activeChildInterrupt = interrupt;
-							},
+							registerInterrupt: (interrupt) => registerStepInterrupt(fi, interrupt),
 							onAttemptStart: (attempt) => updateStepModel(fi, attempt.model, attempt.thinking),
 							onChildEvent: (event) => updateStepFromChildEvent(fi, event),
 						});
@@ -2019,11 +2079,12 @@ async function runSubagent(config: SubagentRunConfig): Promise<void> {
 
 						const taskEndTime = Date.now();
 						const taskDuration = taskEndTime - taskStartTime;
+						const childInterrupted = singleResult.interrupted === true;
 
-						statusPayload.steps[fi].status = singleResult.exitCode === 0 ? "complete" : "failed";
+						statusPayload.steps[fi].status = childInterrupted ? "paused" : singleResult.exitCode === 0 ? "complete" : "failed";
 						statusPayload.steps[fi].endedAt = taskEndTime;
 						statusPayload.steps[fi].durationMs = taskDuration;
-						statusPayload.steps[fi].exitCode = singleResult.exitCode;
+						statusPayload.steps[fi].exitCode = childInterrupted ? 0 : singleResult.exitCode;
 						statusPayload.steps[fi].model = singleResult.model;
 						statusPayload.steps[fi].thinking = resolveEffectiveThinking(singleResult.model, statusPayload.steps[fi].thinking);
 						statusPayload.steps[fi].attemptedModels = singleResult.attemptedModels;
@@ -2037,9 +2098,9 @@ async function runSubagent(config: SubagentRunConfig): Promise<void> {
 						writeStatusPayload();
 
 						appendJsonl(eventsPath, JSON.stringify({
-							type: singleResult.exitCode === 0 ? "subagent.step.completed" : "subagent.step.failed",
+							type: childInterrupted ? "subagent.step.paused" : singleResult.exitCode === 0 ? "subagent.step.completed" : "subagent.step.failed",
 							ts: taskEndTime, runId: id, stepIndex: fi, agent: task.agent,
-							exitCode: singleResult.exitCode, durationMs: taskDuration,
+							exitCode: childInterrupted ? 0 : singleResult.exitCode, durationMs: taskDuration,
 						}));
 						if (singleResult.completionGuardTriggered) {
 							const event = buildControlEvent({
@@ -2086,9 +2147,10 @@ async function runSubagent(config: SubagentRunConfig): Promise<void> {
 						agent: pr.agent,
 						output: pr.output,
 						error: pr.error,
-						success: pr.exitCode === 0,
-						exitCode: pr.exitCode,
+						success: pr.interrupted !== true && pr.exitCode === 0,
+						exitCode: pr.interrupted === true ? 0 : pr.exitCode,
 						skipped: pr.skipped,
+						interrupted: pr.interrupted,
 						sessionFile: pr.sessionFile,
 						intercomTarget: pr.intercomTarget,
 						model: pr.model,
@@ -2173,9 +2235,7 @@ async function runSubagent(config: SubagentRunConfig): Promise<void> {
 				childIntercomTarget: config.childIntercomTargets?.[flatIndex],
 				orchestratorIntercomTarget: config.controlIntercomTarget,
 				nestedRoute: config.nestedRoute,
-				registerInterrupt: (interrupt) => {
-					activeChildInterrupt = interrupt;
-				},
+				registerInterrupt: (interrupt) => registerStepInterrupt(flatIndex, interrupt),
 				onAttemptStart: (attempt) => updateStepModel(flatIndex, attempt.model, attempt.thinking),
 				onChildEvent: (event) => updateStepFromChildEvent(flatIndex, event),
 			});
@@ -2188,8 +2248,8 @@ async function runSubagent(config: SubagentRunConfig): Promise<void> {
 				agent: singleResult.agent,
 				output: singleResult.output,
 				error: singleResult.error,
-				success: singleResult.exitCode === 0,
-				exitCode: singleResult.exitCode,
+				success: singleResult.interrupted !== true && singleResult.exitCode === 0,
+				exitCode: singleResult.interrupted === true ? 0 : singleResult.exitCode,
 				sessionFile: singleResult.sessionFile,
 				intercomTarget: singleResult.intercomTarget,
 				model: singleResult.model,
@@ -2200,6 +2260,7 @@ async function runSubagent(config: SubagentRunConfig): Promise<void> {
 				structuredOutputPath: singleResult.structuredOutputPath,
 				structuredOutputSchemaPath: singleResult.structuredOutputSchemaPath,
 				acceptance: singleResult.acceptance,
+				interrupted: singleResult.interrupted,
 			});
 			if (seqStep.outputName) {
 				outputs[seqStep.outputName] = outputEntryFromAsyncResult({
@@ -2232,10 +2293,11 @@ async function runSubagent(config: SubagentRunConfig): Promise<void> {
 			}
 
 			const stepEndTime = Date.now();
-			statusPayload.steps[flatIndex].status = singleResult.exitCode === 0 ? "complete" : "failed";
+			const childInterrupted = singleResult.interrupted === true;
+			statusPayload.steps[flatIndex].status = childInterrupted ? "paused" : singleResult.exitCode === 0 ? "complete" : "failed";
 			statusPayload.steps[flatIndex].endedAt = stepEndTime;
 			statusPayload.steps[flatIndex].durationMs = stepEndTime - stepStartTime;
-			statusPayload.steps[flatIndex].exitCode = singleResult.exitCode;
+			statusPayload.steps[flatIndex].exitCode = childInterrupted ? 0 : singleResult.exitCode;
 			statusPayload.steps[flatIndex].model = singleResult.model;
 			statusPayload.steps[flatIndex].thinking = resolveEffectiveThinking(singleResult.model, statusPayload.steps[flatIndex].thinking);
 			statusPayload.steps[flatIndex].attemptedModels = singleResult.attemptedModels;
@@ -2253,12 +2315,12 @@ async function runSubagent(config: SubagentRunConfig): Promise<void> {
 			writeStatusPayload();
 
 			appendJsonl(eventsPath, JSON.stringify({
-				type: singleResult.exitCode === 0 ? "subagent.step.completed" : "subagent.step.failed",
+				type: childInterrupted ? "subagent.step.paused" : singleResult.exitCode === 0 ? "subagent.step.completed" : "subagent.step.failed",
 				ts: stepEndTime,
 				runId: id,
 				stepIndex: flatIndex,
 				agent: seqStep.agent,
-				exitCode: singleResult.exitCode,
+				exitCode: childInterrupted ? 0 : singleResult.exitCode,
 				durationMs: stepEndTime - stepStartTime,
 				tokens: stepTokens,
 			}));
@@ -2398,6 +2460,7 @@ async function runSubagent(config: SubagentRunConfig): Promise<void> {
 				error: r.error,
 				success: r.success,
 				skipped: r.skipped || undefined,
+				interrupted: r.interrupted || undefined,
 				sessionFile: r.sessionFile,
 				intercomTarget: r.intercomTarget,
 				model: r.model,

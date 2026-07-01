@@ -236,6 +236,15 @@ function formatToolUseStat(count: number): string {
 	return `${count} tool use${count === 1 ? "" : "s"}`;
 }
 
+function formatTotalCostStat(totalCost: Details["totalCost"] | undefined): string {
+	if (!totalCost || (totalCost.inputTokens === 0 && totalCost.outputTokens === 0 && totalCost.costUsd === 0)) return "";
+	const parts: string[] = [];
+	if (totalCost.inputTokens) parts.push(`in:${formatTokens(totalCost.inputTokens)}`);
+	if (totalCost.outputTokens) parts.push(`out:${formatTokens(totalCost.outputTokens)}`);
+	if (totalCost.costUsd) parts.push(`$${totalCost.costUsd.toFixed(4)}`);
+	return parts.join(" ");
+}
+
 function formatProgressStats(theme: Theme, progress: Pick<AgentProgress, "toolCount" | "tokens" | "durationMs"> | undefined, includeDuration = true): string {
 	if (!progress) return "";
 	const parts: string[] = [];
@@ -1315,7 +1324,7 @@ function renderMultiCompact(d: Details, theme: Theme, frame?: number): Component
 	}
 	const multiLabel = buildMultiProgressLabel(d, hasRunning);
 	const itemTitle = multiLabel.itemTitle;
-	const stats = statJoin(theme, [multiLabel.headerLabel, formatProgressStats(theme, totalSummary)]);
+	const stats = statJoin(theme, [multiLabel.headerLabel, formatProgressStats(theme, totalSummary), formatTotalCostStat(d.totalCost)]);
 	const glyph = hasRunning
 		? theme.fg("accent", runningGlyph(frame !== undefined ? (runningSeed(progressRunningSeed(totalSummary), d.currentStepIndex) ?? 0) + frame : runningSeed(progressRunningSeed(totalSummary), d.currentStepIndex)))
 		: failed
@@ -1547,10 +1556,13 @@ export function renderSubagentResult(
 			{ toolCount: 0, tokens: 0, durationMs: 0 },
 		);
 
-	const summaryStr =
+	const summaryParts = [
 		totalSummary.toolCount || totalSummary.tokens
-			? ` | ${totalSummary.toolCount} tools, ${formatTokens(totalSummary.tokens)} tok, ${formatDuration(totalSummary.durationMs)}`
-			: "";
+			? `${totalSummary.toolCount} tools, ${formatTokens(totalSummary.tokens)} tok, ${formatDuration(totalSummary.durationMs)}`
+			: "",
+		formatTotalCostStat(d.totalCost),
+	].filter(Boolean);
+	const summaryStr = summaryParts.length ? ` | ${summaryParts.join(", ")}` : "";
 
 	const modeLabel = d.mode;
 	const contextBadge = d.context === "fork" ? theme.fg("warning", " [fork]") : "";

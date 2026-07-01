@@ -15,6 +15,7 @@ import * as os from "node:os";
 import * as path from "node:path";
 import { createEventBus, createMockPi, createTempDir, events, makeAgent, makeMinimalCtx, removeTempDir, tryImport } from "../support/helpers.ts";
 import type { MockPi } from "../support/helpers.ts";
+import { deliverInterruptRequest } from "../../src/runs/background/control-channel.ts";
 
 interface AsyncExecutionResult {
 	content: Array<{ text?: string }>;
@@ -325,6 +326,50 @@ describe("async execution utilities", { skip: !available ? "pi packages not avai
 		} finally {
 			removeTempDir(dir);
 		}
+	});
+
+	it("interrupts every active async parallel child", { skip: !isAsyncAvailable() ? "jiti not available" : undefined }, async () => {
+		mockPi.onCall({ delay: 5_000, output: "one done" });
+		mockPi.onCall({ delay: 5_000, output: "two done" });
+		mockPi.onCall({ delay: 5_000, output: "three done" });
+		const id = `async-interrupt-parallel-${Date.now().toString(36)}`;
+		executeAsyncChain(id, {
+			chain: [{
+				parallel: [
+					{ agent: "one", task: "Wait" },
+					{ agent: "two", task: "Wait" },
+					{ agent: "three", task: "Wait" },
+				],
+				concurrency: 3,
+			}],
+			resultMode: "parallel",
+			agents: [makeAgent("one"), makeAgent("two"), makeAgent("three")],
+			ctx: { pi: { events: { emit() {} } }, cwd: tempDir, currentSessionId: "session-1" },
+			artifactConfig: {
+				enabled: false,
+				includeInput: false,
+				includeOutput: false,
+				includeJsonl: false,
+				includeMetadata: false,
+				cleanupDays: 7,
+			},
+			shareEnabled: false,
+			maxSubagentDepth: 2,
+		});
+
+		await waitForMockPiCall(mockPi, 2, 10_000);
+		const asyncDir = path.join(ASYNC_DIR, id);
+		const statusPath = path.join(asyncDir, "status.json");
+		const statusBeforeInterrupt = JSON.parse(fs.readFileSync(statusPath, "utf-8")) as AsyncStatusPayload & { pid?: number };
+		deliverInterruptRequest({ asyncDir, pid: statusBeforeInterrupt.pid, source: "test" });
+
+		const resultPath = await waitForAsyncResultFile(id, 3_000);
+		const payload = JSON.parse(fs.readFileSync(resultPath, "utf-8")) as AsyncResultPayload;
+		const status = JSON.parse(fs.readFileSync(statusPath, "utf-8")) as AsyncStatusPayload;
+		assert.equal(payload.state, "paused");
+		assert.equal(payload.success, false);
+		assert.deepEqual(status.steps?.map((step) => step.status), ["paused", "paused", "paused"]);
+		assert.equal(mockPi.callCount(), 3);
 	});
 
 	it("async launch messages tell the parent not to sleep-poll", { skip: !isAsyncAvailable() ? "jiti not available" : undefined }, async () => {

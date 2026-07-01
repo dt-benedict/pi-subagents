@@ -152,9 +152,15 @@ export type PublicNestedStepSummary = Pick<
 	children?: PublicNestedRunSummary[];
 };
 
+export type CostSummary = {
+	inputTokens: number;
+	outputTokens: number;
+	costUsd: number;
+};
+
 export type PublicNestedRunSummary = Pick<
 	NestedRunSummary,
-	"id" | "parentRunId" | "parentStepIndex" | "parentAgent" | "depth" | "path" | "asyncDir" | "sessionId" | "sessionFile" | "intercomTarget" | "ownerIntercomTarget" | "leafIntercomTarget" | "ownerState" | "mode" | "state" | "agent" | "agents" | "currentStep" | "chainStepCount" | "parallelGroups" | "activityState" | "lastActivityAt" | "currentTool" | "currentToolStartedAt" | "currentPath" | "turnCount" | "toolCount" | "totalTokens" | "startedAt" | "endedAt" | "lastUpdate" | "error"
+	"id" | "parentRunId" | "parentStepIndex" | "parentAgent" | "depth" | "path" | "asyncDir" | "sessionId" | "sessionFile" | "intercomTarget" | "ownerIntercomTarget" | "leafIntercomTarget" | "ownerState" | "mode" | "state" | "agent" | "agents" | "currentStep" | "chainStepCount" | "parallelGroups" | "activityState" | "lastActivityAt" | "currentTool" | "currentToolStartedAt" | "currentPath" | "turnCount" | "toolCount" | "totalTokens" | "totalCost" | "startedAt" | "endedAt" | "lastUpdate" | "error"
 > & {
 	steps?: PublicNestedStepSummary[];
 	children?: PublicNestedRunSummary[];
@@ -416,6 +422,7 @@ export interface SingleResult {
 	structuredOutputPath?: string;
 	structuredOutputSchemaPath?: string;
 	acceptance?: AcceptanceLedger;
+	children?: NestedRunSummary[];
 }
 
 export interface Details {
@@ -444,12 +451,10 @@ export interface Details {
 	currentStepIndex?: number;   // 0-indexed current step (for running chains)
 	workflowGraph?: WorkflowGraphSnapshot;
 	outputs?: ChainOutputMap;
+	// Aggregated child usage across all agents in the run
+	totalChildUsage?: Usage;
 	// Aggregated cost across all agents in the run
-	totalCost?: {
-		inputTokens: number;
-		outputTokens: number;
-		costUsd: number;
-	};
+	totalCost?: CostSummary;
 }
 
 // ============================================================================
@@ -539,6 +544,7 @@ export interface NestedRunSummary extends NestedRunAddress {
 	turnCount?: number;
 	toolCount?: number;
 	totalTokens?: TokenUsage;
+	totalCost?: CostSummary;
 	startedAt?: number;
 	endedAt?: number;
 	lastUpdate?: number;

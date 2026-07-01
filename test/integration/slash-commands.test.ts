@@ -994,6 +994,71 @@ describe("subagents-models slash command", { skip: !available ? "slash-commands.
 	});
 });
 
+describe("subagent cost slash command", { skip: !available ? "slash-commands.ts not importable" : undefined }, () => {
+	it("reports parent and child usage from the current session branch", async () => {
+		const sent: unknown[] = [];
+		const commands = new Map<string, RegisteredSlashCommand>();
+		const pi = {
+			events: createEventBus(),
+			registerCommand(name: string, spec: RegisteredSlashCommand) {
+				commands.set(name, spec);
+			},
+			registerShortcut() {},
+			sendMessage(message: unknown) { sent.push(message); },
+		};
+		const parentUsage = {
+			input: 100,
+			output: 50,
+			cacheRead: 10,
+			cacheWrite: 5,
+			cost: { input: 0.001, output: 0.002, cacheRead: 0, cacheWrite: 0, total: 0.003 },
+		};
+		const childUsage = { input: 20, output: 10, cacheRead: 2, cacheWrite: 1, cost: 0.004, turns: 1 };
+		const slashChildUsage = { input: 30, output: 15, cacheRead: 0, cacheWrite: 0, cost: 0.005, turns: 2 };
+		registerSlashCommands!(pi, createState(process.cwd()));
+		await commands.get("subagent-cost")!.handler("", createCommandContext({
+			sessionManager: {
+				getBranch: () => [
+					{ type: "message", message: { role: "assistant", usage: parentUsage } },
+					{
+						type: "message",
+						message: {
+							role: "toolResult",
+							toolName: "subagent",
+							details: {
+								mode: "single",
+								results: [{ agent: "worker", task: "fix", exitCode: 0, messages: [], usage: childUsage, sessionFile: "/tmp/worker.jsonl" }],
+							},
+						},
+					},
+					{
+						type: "custom_message",
+						customType: SLASH_RESULT_TYPE,
+						details: {
+							requestId: "slash-1",
+							result: {
+								content: [{ type: "text", text: "done" }],
+								details: {
+									mode: "single",
+									results: [{ agent: "reviewer", task: "review", exitCode: 0, messages: [], usage: slashChildUsage }],
+								},
+							},
+						},
+					},
+				],
+			},
+		}));
+
+		const output = String((sent[0] as { content?: unknown }).content ?? "");
+		assert.match(output, /Parent: ↑100 ↓50 \$0\.0030/);
+		assert.match(output, /Child 1 \(worker\): ↑20 ↓10 \$0\.0040/);
+		assert.match(output, /Session: \/tmp\/worker\.jsonl/);
+		assert.match(output, /Child 2 \(reviewer\): ↑30 ↓15 \$0\.0050/);
+		assert.match(output, /Children: ↑50 ↓25 \$0\.0090/);
+		assert.match(output, /Total: ↑150 ↓75 \$0\.0120/);
+	});
+});
+
 describe("subagent profiles slash commands", { skip: !available ? "slash-commands.ts not importable" : undefined }, () => {
 	it("lists saved profiles", async () => {
 		await withIsolatedHome(async () => {
