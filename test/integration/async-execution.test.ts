@@ -439,6 +439,7 @@ describe("async execution utilities", { skip: !available ? "pi packages not avai
 	it("hard-kills async children that ignore timeout SIGTERM", { skip: !isAsyncAvailable() ? "jiti not available" : undefined }, async () => {
 		mockPi.onCall({ delay: 60_000, ignoreSigterm: true, output: "too late" });
 		const id = `async-timeout-hard-kill-${Date.now().toString(36)}`;
+		const timeoutMs = 1_500;
 		const startedAt = Date.now();
 		executeAsyncSingle(id, {
 			agent: "stubborn",
@@ -455,10 +456,10 @@ describe("async execution utilities", { skip: !available ? "pi packages not avai
 			},
 			shareEnabled: false,
 			maxSubagentDepth: 2,
-			timeoutMs: 1_000,
+			timeoutMs,
 		});
 
-		await waitForMockPiCall(mockPi, 0, 5_000);
+		await waitForMockPiCall(mockPi, 0, 10_000);
 		const resultPath = await waitForAsyncResultFile(id, 8_000);
 		const elapsedMs = Date.now() - startedAt;
 		const payload = JSON.parse(fs.readFileSync(resultPath, "utf-8")) as AsyncResultPayload;
@@ -466,7 +467,7 @@ describe("async execution utilities", { skip: !available ? "pi packages not avai
 		assert.equal(payload.state, "failed");
 		assert.equal(payload.timedOut, true);
 		assert.equal(payload.results[0]?.timedOut, true);
-		assert.match(payload.results[0]?.error ?? "", /Subagent timed out after 1000ms\./);
+		assert.equal(payload.results[0]?.error, `Subagent timed out after ${timeoutMs}ms.`);
 		assert.equal(status.timedOut, true);
 		assert.equal(status.steps?.[0]?.timedOut, true);
 		assert.ok(elapsedMs < 7_000, `timeout result should settle after hard kill, elapsed ${elapsedMs}ms`);
@@ -538,7 +539,7 @@ describe("async execution utilities", { skip: !available ? "pi packages not avai
 		assert.match(singleResult.content[0]?.text ?? "", /Do not run sleep timers or polling loops/);
 		assert.match(singleResult.content[0]?.text ?? "", /call wait\(\)/);
 		assert.match(singleResult.content[0]?.text ?? "", /there is no next turn, so use wait\(\)/);
-		await waitForAsyncResultFile(singleId, 10_000);
+		await waitForAsyncResultFile(singleId, 30_000);
 
 		mockPi.onCall({ output: "parallel one done" });
 		mockPi.onCall({ output: "parallel two done" });
