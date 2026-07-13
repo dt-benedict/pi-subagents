@@ -1,4 +1,7 @@
+import { spawn } from "node:child_process";
 import * as fs from "node:fs";
+import * as os from "node:os";
+import * as path from "node:path";
 import type { ExtensionAPI, ExtensionContext } from "@mariozechner/pi-coding-agent";
 import {
 	buildBuiltinOverrideConfig,
@@ -10,9 +13,11 @@ import {
 	type BuiltinAgentOverrideBase,
 } from "../agents/agents.ts";
 import { serializeAgent } from "../agents/agent-serializer.ts";
+import { findModelInfo, getLiveAvailableModels, getSupportedThinkingLevels, toModelInfo } from "../shared/model-info.ts";
 
 const ADMIN_MESSAGE_TYPE = "subagents-admin";
 const INHERIT_MODEL_CHOICE = "Default / inherit session model";
+const INHERIT_THINKING_CHOICE = "Default / inherit session thinking";
 
 type ModelInfo = { provider: string; id: string };
 
@@ -121,13 +126,33 @@ function metadataFor(agent: AgentConfig): string {
 }
 
 async function chooseModel(ctx: ExtensionContext, agent: AgentConfig): Promise<string | undefined | null> {
-	const models = ctx.modelRegistry.getAvailable().map((model) => modelFullId(model));
+	const models = getLiveAvailableModels(ctx.modelRegistry).map((model) => modelFullId(model));
 	const current = agent.model ?? INHERIT_MODEL_CHOICE;
 	const choices = [INHERIT_MODEL_CHOICE, ...models.filter((model) => model !== agent.model)];
 	if (agent.model && !choices.includes(agent.model)) choices.splice(1, 0, agent.model);
 	const choice = await ctx.ui.select(`Select model for ${agent.name}\nCurrent: ${current}`, choices);
 	if (!choice) return null;
 	return choice === INHERIT_MODEL_CHOICE ? undefined : choice;
+}
+
+async function chooseThinking(ctx: ExtensionContext, agent: AgentConfig): Promise<string | undefined | null> {
+	// Filter the offered levels to what the agent's configured model actually supports
+	// (e.g. a non-reasoning model only offers "off"). Falls back to all levels when the
+	// model is inherited or cannot be uniquely resolved.
+	const availableModels = getLiveAvailableModels(ctx.modelRegistry).map(toModelInfo);
+	const modelInfo = findModelInfo(agent.model, availableModels, ctx.model?.provider);
+	const levels = getSupportedThinkingLevels(modelInfo);
+	const current = agent.thinking ?? INHERIT_THINKING_CHOICE;
+	const choices: string[] = [INHERIT_THINKING_CHOICE, ...levels];
+	// Keep the current value selectable even if the model no longer advertises it.
+	if (agent.thinking && !choices.includes(agent.thinking)) choices.splice(1, 0, agent.thinking);
+	const modelNote = agent.model ? `Model: ${agent.model}` : "Model: default / inherit";
+	const choice = await ctx.ui.select(
+		`Select thinking level for ${agent.name}\n${modelNote} · Current: ${current}`,
+		choices,
+	);
+	if (!choice) return null;
+	return choice === INHERIT_THINKING_CHOICE ? undefined : choice;
 }
 
 async function chooseBuiltinOverrideScope(ctx: ExtensionContext, agent: AgentConfig): Promise<"user" | "project" | undefined> {
@@ -160,6 +185,118 @@ async function saveAgentModel(ctx: ExtensionContext, agent: AgentConfig, selecte
 		: `Cleared '${agent.name}' model in ${updated.filePath}.`;
 }
 
+async function saveAgentThinking(ctx: ExtensionContext, agent: AgentConfig, selectedThinking: string | undefined): Promise<string> {
+	if (agent.source === "builtin") {
+		const scope = await chooseBuiltinOverrideScope(ctx, agent);
+		if (!scope) return "Cancelled.";
+		const base = agent.override?.base ?? buildBuiltinBase(agent);
+		const draft: AgentConfig = { ...agent, thinking: selectedThinking };
+		const override = buildBuiltinOverrideConfig(base, draft);
+		const filePath = override
+			? saveBuiltinAgentOverride(ctx.cwd, agent.name, scope, override)
+			: removeBuiltinAgentOverride(ctx.cwd, agent.name, scope);
+		return selectedThinking
+			? `Saved ${scope} override for builtin '${agent.name}' with thinking '${selectedThinking}' in ${filePath}.`
+			: `Cleared thinking override for builtin '${agent.name}' in ${filePath}.`;
+	}
+
+	const updated: AgentConfig = { ...agent, thinking: selectedThinking };
+	fs.writeFileSync(updated.filePath, serializeAgent(updated), "utf-8");
+	return selectedThinking
+		? `Updated '${agent.name}' thinking to '${selectedThinking}' in ${updated.filePath}.`
+		: `Cleared '${agent.name}' thinking in ${updated.filePath}.`;
+}
+
+/** Compact one-line summary shown in the interactive picker (no full system prompt dump). */
+function metadataSummary(agent: AgentConfig): string {
+	return [
+		`Source: ${agent.source}`,
+		`Model: ${agent.model ?? "default / inherit"}`,
+		`Thinking: ${agent.thinking ?? "default / inherit"}`,
+	].join(" · ");
+}
+
+interface EditorSpec {
+	command: string;
+	args: string[];
+	raw: string;
+}
+
+/**
+ * Resolve the external editor command. Uses $VISUAL/$EDITOR (expected to block, e.g.
+ * `open -W -n -a MarkEdit`), falling back to MarkEdit on macOS. Terminal editors that
+ * need an attached TTY are not supported here since pi owns the terminal.
+ */
+function resolveEditorCommand(): EditorSpec | undefined {
+	const raw = (process.env.VISUAL || process.env.EDITOR || "").trim()
+		|| (process.platform === "darwin" ? "open -W -n -a MarkEdit" : "");
+	if (!raw) return undefined;
+	const parts = raw.split(/\s+/).filter(Boolean);
+	if (parts.length === 0) return undefined;
+	return { command: parts[0]!, args: parts.slice(1), raw };
+}
+
+function editorLabel(editor: EditorSpec): string {
+	const appIdx = editor.args.indexOf("-a");
+	if (editor.command === "open" && appIdx !== -1 && editor.args[appIdx + 1]) return editor.args[appIdx + 1]!;
+	return editor.command;
+}
+
+function runEditorAndWait(editor: EditorSpec, filePath: string): Promise<void> {
+	return new Promise((resolve, reject) => {
+		const child = spawn(editor.command, [...editor.args, filePath], { stdio: "ignore" });
+		child.once("error", reject);
+		child.once("close", () => resolve());
+	});
+}
+
+async function saveAgentSystemPrompt(ctx: ExtensionContext, agent: AgentConfig, systemPrompt: string): Promise<string> {
+	const nextPrompt = systemPrompt.replace(/\s+$/, "");
+	if (agent.source === "builtin") {
+		const scope = await chooseBuiltinOverrideScope(ctx, agent);
+		if (!scope) return "Cancelled.";
+		const base = agent.override?.base ?? buildBuiltinBase(agent);
+		const draft: AgentConfig = { ...agent, systemPrompt: nextPrompt };
+		const override = buildBuiltinOverrideConfig(base, draft);
+		const filePath = override
+			? saveBuiltinAgentOverride(ctx.cwd, agent.name, scope, override)
+			: removeBuiltinAgentOverride(ctx.cwd, agent.name, scope);
+		return `Saved ${scope} override for builtin '${agent.name}' system prompt in ${filePath}.`;
+	}
+	const updated: AgentConfig = { ...agent, systemPrompt: nextPrompt };
+	fs.writeFileSync(updated.filePath, serializeAgent(updated), "utf-8");
+	return `Updated '${agent.name}' system prompt in ${updated.filePath}.`;
+}
+
+/**
+ * Round-trip the agent's system prompt through the user's external editor: write it to a
+ * temp .md file, open the editor and wait for it to close, then persist the result.
+ * Returns the status message, or null when nothing should be posted.
+ */
+async function editSystemPrompt(ctx: ExtensionContext, agent: AgentConfig): Promise<string | null> {
+	const editor = resolveEditorCommand();
+	if (!editor) {
+		return "No editor configured. Set $VISUAL or $EDITOR (e.g. 'open -W -n -a MarkEdit').";
+	}
+	const label = editorLabel(editor);
+	const dir = fs.mkdtempSync(path.join(os.tmpdir(), "pi-subagent-prompt-"));
+	const tmpPath = path.join(dir, `${agent.name}.md`);
+	try {
+		fs.writeFileSync(tmpPath, agent.systemPrompt ?? "", "utf-8");
+		ctx.ui.notify(`Editing '${agent.name}' system prompt in ${label}. Save and close the editor window to apply.`, "info");
+		ctx.ui.setStatus("subagents-edit", `Waiting for ${label} to close…`);
+		await runEditorAndWait(editor, tmpPath);
+		const edited = fs.readFileSync(tmpPath, "utf-8");
+		if (edited.replace(/\s+$/, "") === (agent.systemPrompt ?? "").replace(/\s+$/, "")) {
+			return `System prompt for '${agent.name}' left unchanged.`;
+		}
+		return await saveAgentSystemPrompt(ctx, agent, edited);
+	} finally {
+		ctx.ui.setStatus("subagents-edit", undefined);
+		try { fs.rmSync(dir, { recursive: true, force: true }); } catch { /* best effort cleanup */ }
+	}
+}
+
 export async function openSubagentsAdmin(pi: ExtensionAPI, ctx: ExtensionContext, args = ""): Promise<void> {
 	const agent = await selectAgent(ctx, args);
 	if (!agent) {
@@ -172,22 +309,47 @@ export async function openSubagentsAdmin(pi: ExtensionAPI, ctx: ExtensionContext
 		return;
 	}
 
-	sendAdminMessage(pi, metadataFor(agent));
-	if (!ctx.hasUI) return;
-
-	const requestedAction = args.trim().split(/\s+/)[1];
-	let action = requestedAction === "model" ? "Change model" : undefined;
-	if (!action) {
-		action = await ctx.ui.select(`Administer ${agent.name}`, ["Change model", "Done"]);
+	if (!ctx.hasUI) {
+		// Non-interactive (tool/headless): emit full metadata as the inspection result.
+		sendAdminMessage(pi, metadataFor(agent));
+		return;
 	}
-	if (action !== "Change model") return;
 
-	const selectedModel = await chooseModel(ctx, agent);
-	if (selectedModel === null) return;
+	const requestedAction = args.trim().split(/\s+/)[1]?.toLowerCase();
+	let action: string | undefined;
+	if (requestedAction === "model") action = "Change model";
+	else if (requestedAction === "thinking") action = "Change thinking level";
+	else if (requestedAction === "prompt" || requestedAction === "system-prompt" || requestedAction === "edit") action = "Edit system prompt";
+	else if (requestedAction === "details" || requestedAction === "info") action = "Show details";
+	if (!action) {
+		action = await ctx.ui.select(
+			`Administer ${agent.name}\n${metadataSummary(agent)}`,
+			["Change model", "Change thinking level", "Edit system prompt", "Show details", "Done"],
+		);
+	}
+
 	try {
-		const message = await saveAgentModel(ctx, agent, selectedModel);
-		ctx.ui.notify(message, "info");
-		sendAdminMessage(pi, message);
+		if (action === "Change model") {
+			const selectedModel = await chooseModel(ctx, agent);
+			if (selectedModel === null) return;
+			const message = await saveAgentModel(ctx, agent, selectedModel);
+			ctx.ui.notify(message, "info");
+			sendAdminMessage(pi, message);
+		} else if (action === "Change thinking level") {
+			const selectedThinking = await chooseThinking(ctx, agent);
+			if (selectedThinking === null) return;
+			const message = await saveAgentThinking(ctx, agent, selectedThinking);
+			ctx.ui.notify(message, "info");
+			sendAdminMessage(pi, message);
+		} else if (action === "Edit system prompt") {
+			const message = await editSystemPrompt(ctx, agent);
+			if (message === null) return;
+			ctx.ui.notify(message, "info");
+			sendAdminMessage(pi, message);
+		} else if (action === "Show details") {
+			// Full metadata is now opt-in (previously always posted to the thread).
+			sendAdminMessage(pi, metadataFor(agent));
+		}
 	} catch (error) {
 		const message = error instanceof Error ? error.message : String(error);
 		ctx.ui.notify(message, "error");

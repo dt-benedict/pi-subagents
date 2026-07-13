@@ -17,6 +17,35 @@ interface RegistryModelLike {
 	thinkingLevelMap?: ThinkingLevelMap;
 }
 
+/**
+ * Minimal structural view of pi's model registry. Kept structural so callers can
+ * pass the ExtensionContext registry without importing its concrete type.
+ */
+export interface LiveModelRegistry<M> {
+	refresh?: () => void;
+	getAvailable: () => M[];
+}
+
+/**
+ * Return the currently available models, refreshing the registry from disk first.
+ *
+ * pi core only reloads models.json on certain actions (e.g. opening `/model`), so
+ * a long-running session otherwise holds a snapshot captured at startup. Without
+ * this refresh, models added or edited in models.json mid-session never appear in
+ * subagent model pickers or validation, and look like a frozen/"hard coded" list.
+ *
+ * Refresh failures fall back to the last-known snapshot instead of throwing, so a
+ * transient models.json write can never break model resolution or execution.
+ */
+export function getLiveAvailableModels<M>(modelRegistry: LiveModelRegistry<M>): M[] {
+	try {
+		modelRegistry.refresh?.();
+	} catch {
+		// Ignore refresh errors and use the last successfully loaded snapshot.
+	}
+	return modelRegistry.getAvailable();
+}
+
 export function toModelInfo(model: RegistryModelLike): ModelInfo {
 	return {
 		provider: model.provider,

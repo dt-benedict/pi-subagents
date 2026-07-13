@@ -406,7 +406,7 @@ export function registerSlashCommands(
 	state: SubagentState,
 ): void {
 	pi.registerCommand("subagents", {
-		description: "Administer subagents: inspect metadata and update configured models",
+		description: "Administer subagents: inspect metadata, update model/thinking level, or edit the system prompt in your editor (/subagents <name> [model|thinking|prompt|details])",
 		handler: async (args, ctx) => {
 			await openSubagentsAdmin(pi, ctx, args);
 		},

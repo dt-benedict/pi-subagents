@@ -241,10 +241,17 @@ Skip this section until you want exact syntax.
 | `/chain agent1 "task1" -> agent2 "task2"` | Run agents in sequence |
 | `/parallel agent1 "task1" -> agent2 "task2"` | Run agents in parallel |
 | `/run-chain <chainName> -- <task>` | Launch a saved `.chain.md` workflow |
-| `/subagents [agent] [model]` | Inspect subagent metadata and interactively update its configured model |
+| `/subagents [agent] [model\|thinking\|prompt\|details]` | Inspect subagent metadata; update its model or thinking level, or edit its system prompt in your editor |
 | `/subagents-doctor` | Show read-only setup diagnostics |
 
-Commands validate agent names locally, support tab completion, and send results back into the conversation. `/subagents` opens a lightweight admin flow: pick an agent, review its metadata, then choose a model from Pi's available model list. User/project agents are updated in their markdown file; builtin agents are updated through `subagents.agentOverrides` in settings.
+Commands validate agent names locally, support tab completion, and send results back into the conversation. `/subagents` opens a lightweight admin flow: pick an agent, then choose an action:
+
+- **Change model** — pick from Pi's available model list.
+- **Change thinking level** — `off`, `minimal`, `low`, `medium`, `high`, `xhigh`, filtered to what the chosen model supports.
+- **Edit system prompt** — opens the prompt in your external editor (`$VISUAL`/`$EDITOR`, e.g. `open -W -n -a MarkEdit`; falls back to MarkEdit on macOS), waits for you to save and close, then persists the result.
+- **Show details** — posts the full metadata into the conversation (opt-in; it is no longer dumped automatically).
+
+A compact `Source · Model · Thinking` summary is shown inline in the picker, and only a short confirmation is sent to the thread after a change. Passing a second argument (`model`, `thinking`, `prompt`, or `details`) jumps straight to that action. User/project agents are updated in their markdown file; builtin agents are updated through `subagents.agentOverrides` in settings.
 
 ### Per-step tasks
 
