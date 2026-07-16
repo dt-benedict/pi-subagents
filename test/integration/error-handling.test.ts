@@ -49,9 +49,10 @@ describe("detectSubagentError", { skip: !detectSubagentError ? "utils not import
 		assert.equal(result.hasError, false);
 	});
 
-	it("detects fatal bash error in last tool result", () => {
+	// Hidden failure = child exited 0 but produced NO output and ended on a hard
+	// error. The scenarios below have no substantive assistant text.
+	it("detects fatal bash error when the agent produced no output", () => {
 		const messages = [
-			{ role: "assistant", content: [{ type: "text", text: "Running..." }] },
 			{
 				role: "toolResult",
 				toolName: "bash",
@@ -64,9 +65,8 @@ describe("detectSubagentError", { skip: !detectSubagentError ? "utils not import
 		assert.equal(result.errorType, "bash");
 	});
 
-	it("detects non-zero exit code in bash output", () => {
+	it("detects non-zero exit code in bash output when the agent produced no output", () => {
 		const messages = [
-			{ role: "assistant", content: [{ type: "text", text: "Running..." }] },
 			{
 				role: "toolResult",
 				toolName: "bash",
@@ -77,6 +77,15 @@ describe("detectSubagentError", { skip: !detectSubagentError ? "utils not import
 		const result = detectSubagentError(messages);
 		assert.equal(result.hasError, true);
 		assert.equal(result.exitCode, 127);
+	});
+
+	it("forgives a tool error once the agent has delivered output", () => {
+		const messages = [
+			{ role: "assistant", content: [{ type: "text", text: "Here is the full report of what I found." }] },
+			{ role: "toolResult", toolName: "bash", isError: false, content: [{ type: "text", text: "command not found" }] },
+		];
+		const result = detectSubagentError(messages);
+		assert.equal(result.hasError, false);
 	});
 
 	it("ignores errors before last successful tool result", () => {
@@ -91,9 +100,8 @@ describe("detectSubagentError", { skip: !detectSubagentError ? "utils not import
 		assert.equal(result.hasError, false);
 	});
 
-	it("detects isError on tool result", () => {
+	it("detects isError tool result when the agent produced no output", () => {
 		const messages = [
-			{ role: "assistant", content: [{ type: "text", text: "Running..." }] },
 			{
 				role: "toolResult",
 				toolName: "write",

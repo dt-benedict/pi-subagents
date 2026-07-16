@@ -382,15 +382,18 @@ Skip this section until you want exact syntax.
 | `/parallel agent1 "task1" -> agent2 "task2"` | Run agents in parallel |
 | `/run-chain <chainName> -- <task>` | Launch a saved `.chain.md` or `.chain.json` workflow |
 | `/subagent-cost` | Show parent plus child subagent token usage and cost for this session |
+| `/subagents [agent] [model\|thinking\|prompt\|details]` | Interactively inspect or edit an agent's model, thinking level, or system prompt |
 | `/subagents-doctor` | Show read-only setup diagnostics |
 | `/subagents-models [agent]` | Show the runtime-loaded builtin model mapping, optionally filtered to one builtin |
 | `/subagents-profiles` | List saved subagent profiles from `~/.pi/agent/profiles/pi-subagents/` |
-| `/subagents-load-profile <name>` | Replace only `settings.subagents` with a saved profile and optionally switch this session to the profile worker model |
+| `/subagents-load-profile <name>` | Replace the active `agentOverrides` mapping while preserving unrelated `settings.subagents` keys, and optionally switch this session to the profile worker model |
 | `/subagents-refresh-provider-models <provider> [--force]` | Create or refresh the cached provider model catalog |
 | `/subagents-generate-profiles <provider>` | Generate `<provider>.quota.json` and `<provider>.quality.json` profiles |
 | `/subagents-check-profile <name>` | Check a saved profile against the current registry and live model probes |
 
 Commands validate agent names locally, support tab completion, and send results back into the conversation.
+
+`/subagents` opens a compact administration flow. Model choices refresh Pi's model registry first, so changes to `models.json` are available without restarting the session. Thinking choices are filtered to the selected model's declared levels, including `max` when explicitly supported. Prompt editing uses a blocking `$VISUAL`/`$EDITOR` command (with MarkEdit as the macOS fallback). Full metadata is opt-in via `details` rather than automatically added to the conversation. For agents currently managed through `settings.subagents.agentOverrides` (including loaded profiles), model/thinking/prompt edits stay in settings instead of introducing a higher-precedence frontmatter pin.
 
 ### Profiles and provider model catalogs
 
@@ -417,6 +420,8 @@ Use the profile workflow like this:
 `/subagents-refresh-provider-models` writes a serialized provider model catalog with observed registry data, simple role-oriented classification, and live probe results from tiny one-shot `pi -p --model ... --no-tools` checks. The cache refreshes when missing or stale; use `--force` to ignore freshness and probe again immediately.
 
 `/subagents-generate-profiles` uses the provider catalog to produce quota and quality profiles. `/subagents-check-profile` re-checks each assigned model in a saved profile against the current registry and a live probe so you can detect model removals, auth problems, or stale assignments.
+
+Loading a profile replaces the full `agentOverrides` mapping but preserves unrelated subagent settings such as `disableBuiltins`, `modelScope`, and watchdog configuration. Profiles may set `model`, `thinking`, and `fallbackModels`. For user/project agents, explicit frontmatter still wins; remove profile-managed fields from the agent Markdown so the profile can supply them.
 
 ### Per-step tasks
 

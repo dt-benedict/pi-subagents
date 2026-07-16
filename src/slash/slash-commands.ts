@@ -15,12 +15,13 @@ import {
 } from "../profiles/profiles.ts";
 import type { SubagentParamsLike } from "../runs/foreground/subagent-executor.ts";
 import { isDynamicParallelStep, isParallelStep, type ChainStep } from "../shared/settings.ts";
-import { findModelInfo, toModelInfo } from "../shared/model-info.ts";
+import { findModelInfo, getLiveAvailableModels, toModelInfo } from "../shared/model-info.ts";
 import { formatTokens } from "../shared/formatters.ts";
 import { assertJsonSchemaObject } from "../runs/shared/structured-output.ts";
 import { validateAcceptanceInput } from "../runs/shared/acceptance.ts";
 import type { SlashSubagentResponse, SlashSubagentUpdate } from "./slash-bridge.ts";
 import { registerPromptWorkflowCommands } from "./prompt-workflows.ts";
+import { openSubagentsAdmin } from "./subagents-admin.ts";
 import {
 	applySlashUpdate,
 	buildSlashInitialResult,
@@ -977,6 +978,13 @@ export function registerSlashCommands(
 	pi: ExtensionAPI,
 	state: SubagentState,
 ): void {
+	pi.registerCommand("subagents", {
+		description: "Administer subagents: inspect metadata and update models, thinking, or prompts",
+		handler: async (args, ctx) => {
+			await openSubagentsAdmin(pi, ctx, args);
+		},
+	});
+
 	pi.registerCommand("run", {
 		description: "Run a subagent directly: /run agent[output=file] [task] [--bg] [--fork]",
 		getArgumentCompletions: makeAgentCompletions(state, false),
@@ -1167,7 +1175,7 @@ export function registerSlashCommands(
 							`Profile loaded. Also switch this session to the profile worker model?\n\n${workerModel}`,
 						);
 						if (shouldSwitch) {
-							const modelInfo = findModelInfo(workerModel, ctx.modelRegistry.getAvailable().map(toModelInfo));
+							const modelInfo = findModelInfo(workerModel, getLiveAvailableModels(ctx.modelRegistry).map(toModelInfo));
 							const model = modelInfo ? ctx.modelRegistry.find(modelInfo.provider, modelInfo.id) : undefined;
 							if (!modelInfo || !model) {
 								lines.push(`Could not switch current session model: '${workerModel}' is not available in the current model registry.`);

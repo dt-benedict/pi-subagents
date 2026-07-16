@@ -2,6 +2,17 @@
 
 ## [Unreleased]
 
+### Added
+- Added a compact `/subagents` administration flow for model and thinking selection, external-editor system-prompt updates, and opt-in metadata details across builtin, package, user, and project agents.
+- Refresh Pi's model registry before model selection and execution resolution, and support the explicitly declared `max` thinking level.
+
+### Changed
+- Profile loading replaces the profile-owned `agentOverrides` mapping while preserving unrelated `settings.subagents` keys such as `disableBuiltins`, `modelScope`, and watchdog configuration. Profiles may also carry thinking and fallback-model assignments.
+- `/subagents` persists edits to settings when an agent is profile/override-managed, avoiding frontmatter pins that would silently defeat later profile switches.
+
+### Fixed
+- Do not promote recoverable child tool errors (for example `find` spawn errors, wrong-path `read` failures, or non-zero exploratory `bash` calls) to run-fatal failures after the agent has already delivered substantive output. Hidden-failure detection remains for zero-output runs.
+
 ## [0.34.0] - 2026-07-07
 
 ### Added

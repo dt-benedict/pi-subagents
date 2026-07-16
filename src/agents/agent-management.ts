@@ -27,7 +27,7 @@ import {
 	buildProactiveSkillSubagentRecommendationLines,
 } from "./proactive-skills.ts";
 import { parseFrontmatter } from "./frontmatter.ts";
-import { toModelInfo } from "../shared/model-info.ts";
+import { getLiveAvailableModels, toModelInfo } from "../shared/model-info.ts";
 import { resolveSubagentModelOverride, type ParentModel } from "../runs/shared/model-fallback.ts";
 import { validateToolBudgetConfig } from "../runs/shared/tool-budget.ts";
 import type { Details, ExtensionConfig, ToolBudgetConfig } from "../shared/types.ts";
@@ -163,7 +163,7 @@ function chainStepWarnings(ctx: ManagementContext, steps: ChainStepConfig[]): st
 	for (let i = 0; i < steps.length; i++) {
 		const s = steps[i]!;
 		if (s.model) {
-			const found = ctx.modelRegistry.getAvailable().some((m) => `${m.provider}/${m.id}` === s.model || m.id === s.model);
+			const found = getLiveAvailableModels(ctx.modelRegistry).some((m) => `${m.provider}/${m.id}` === s.model || m.id === s.model);
 			if (!found) warnings.push(`Warning: step ${i + 1} (${s.agent}): model '${s.model}' is not in the current model registry.`);
 		}
 		if (Array.isArray(s.skills) && s.skills.length > 0) {
@@ -176,13 +176,13 @@ function chainStepWarnings(ctx: ManagementContext, steps: ChainStepConfig[]): st
 
 function modelWarning(ctx: ManagementContext, model: string | undefined): string | undefined {
 	if (!model) return undefined;
-	const found = ctx.modelRegistry.getAvailable().some((m) => `${m.provider}/${m.id}` === model || m.id === model);
+	const found = getLiveAvailableModels(ctx.modelRegistry).some((m) => `${m.provider}/${m.id}` === model || m.id === model);
 	return found ? undefined : `Warning: model '${model}' is not in the current model registry.`;
 }
 
 function fallbackModelsWarning(ctx: ManagementContext, fallbackModels: string[] | undefined): string | undefined {
 	if (!fallbackModels || fallbackModels.length === 0) return undefined;
-	const available = new Set(ctx.modelRegistry.getAvailable().flatMap((m) => [`${m.provider}/${m.id}`, m.id]));
+	const available = new Set(getLiveAvailableModels(ctx.modelRegistry).flatMap((m) => [`${m.provider}/${m.id}`, m.id]));
 	const missing = fallbackModels.filter((model) => !available.has(model));
 	return missing.length ? `Warning: fallback models not in the current model registry: ${missing.join(", ")}.` : undefined;
 }
@@ -624,7 +624,7 @@ function handleModels(params: ManagementParams, ctx: ManagementContext): AgentTo
 
 	const discovered = discoverAgentsAll(ctx.cwd);
 	const builtinByName = new Map(discovered.builtin.map((agent) => [agent.name, agent]));
-	const availableModels = ctx.modelRegistry.getAvailable().map(toModelInfo);
+	const availableModels = getLiveAvailableModels(ctx.modelRegistry).map(toModelInfo);
 	const currentModel = ctx.model ? { provider: ctx.model.provider, id: ctx.model.id } : undefined;
 	const preferredProvider = ctx.model?.provider;
 	const names = requestedAgent ? [requestedAgent] : [...BUILTIN_AGENT_NAMES];

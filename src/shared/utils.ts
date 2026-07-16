@@ -385,26 +385,40 @@ export function compactForegroundDetails(details: Details): Details {
 }
 
 /**
- * Detect errors in subagent execution from messages (only errors with no subsequent success)
+ * Detect a *hidden* failure in a subagent run that exited 0.
+ *
+ * Tool errors (a failed `find`, a `read` on a missing path, a non-zero `bash`,
+ * a transient `spawn ENOEXEC`, etc.) are NORMAL, recoverable events inside an
+ * agent loop: the child's LLM receives them as ordinary tool results and works
+ * around them. They must never be promoted to a run-fatal error just because
+ * they appear in the transcript — doing so made parallel workers die
+ * non-deterministically whenever a single exploratory tool call happened to be
+ * the last thing before the agent wrapped up.
+ *
+ * Policy: if the agent produced any substantive final text output, it
+ * delivered its answer, so we trust the child's clean exit regardless of tool
+ * errors anywhere in the transcript (including a trailing verification call
+ * that errored). We only report a hidden failure when the agent produced NO
+ * substantive output at all — a genuine silent death (crash / gave up / hit
+ * limits right after a failing tool call).
  */
 export function detectSubagentError(messages: Message[]): ErrorInfo {
-	let lastAssistantTextIndex = -1;
-	for (let i = messages.length - 1; i >= 0; i--) {
-		const msg = messages[i];
-		if (msg.role === "assistant") {
-			const hasText = Array.isArray(msg.content) && msg.content.some(
-				(c) => c.type === "text" && "text" in c && typeof c.text === "string" && c.text.trim().length > 0,
-			);
-			if (hasText) {
-				lastAssistantTextIndex = i;
-				break;
-			}
-		}
+	const hasSubstantiveText = (msg: Message): boolean =>
+		msg.role === "assistant" &&
+		Array.isArray(msg.content) &&
+		msg.content.some(
+			(c) => c.type === "text" && "text" in c && typeof c.text === "string" && c.text.trim().length > 0,
+		);
+
+	// The agent delivered a real answer somewhere -> the run succeeded. Trailing
+	// or intermediate tool errors were handled by the child and are not fatal.
+	if (messages.some(hasSubstantiveText)) {
+		return { hasError: false };
 	}
 
-	const scanStart = lastAssistantTextIndex >= 0 ? lastAssistantTextIndex + 1 : 0;
-
-	for (let i = messages.length - 1; i >= scanStart; i--) {
+	// No substantive output: inspect the transcript tail for a hard failure the
+	// agent never recovered from before it exited.
+	for (let i = messages.length - 1; i >= 0; i--) {
 		const msg = messages[i];
 		if (msg.role !== "toolResult") continue;
 		const toolName = "toolName" in msg && typeof msg.toolName === "string" ? msg.toolName : undefined;
@@ -436,9 +450,8 @@ export function detectSubagentError(messages: Message[]): ErrorInfo {
 			}
 		}
 
-		// NOTE: These patterns can match legitimate output (grep results, logs,
-		// testing). With the assistant-message check above, most false positives
-		// are mitigated since the agent will have responded after routine errors.
+		// Only reached when the agent produced no output at all, so these coarse
+		// patterns can no longer collide with a delivered answer's tool output.
 		const fatalPatterns = [
 			/command not found/i,
 			/permission denied/i,

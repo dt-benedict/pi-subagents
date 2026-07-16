@@ -247,6 +247,8 @@ describe("buildPiArgs model wiring", () => {
 
 		assert.equal(applyThinkingSuffix("anthropic/claude-haiku-4-5", "off"), "anthropic/claude-haiku-4-5:off");
 		assert.equal(applyThinkingSuffix("anthropic/claude-haiku-4-5:high", "off", true), "anthropic/claude-haiku-4-5:off");
+		assert.equal(applyThinkingSuffix("bluebox-azure-openai/gpt-5_6-sol", "max"), "bluebox-azure-openai/gpt-5_6-sol:max");
+		assert.equal(applyThinkingSuffix("bluebox-azure-openai/gpt-5_6-sol:max", "high", true), "bluebox-azure-openai/gpt-5_6-sol:high");
 		assert.ok(args.includes("--model"));
 		assert.ok(args.includes("anthropic/claude-haiku-4-5:off"));
 	});
