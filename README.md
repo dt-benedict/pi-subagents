@@ -247,7 +247,7 @@ Skip this section until you want exact syntax.
 Commands validate agent names locally, support tab completion, and send results back into the conversation. `/subagents` opens a lightweight admin flow: pick an agent, then choose an action:
 
 - **Change model** — pick from Pi's available model list.
-- **Change thinking level** — `off`, `minimal`, `low`, `medium`, `high`, `xhigh`, filtered to what the chosen model supports.
+- **Change thinking level** — `off`, `minimal`, `low`, `medium`, `high`, `xhigh`, `max`, filtered to what the chosen model supports (`xhigh`/`max` require the model to declare them in its `thinkingLevelMap`).
 - **Edit system prompt** — opens the prompt in your external editor (`$VISUAL`/`$EDITOR`, e.g. `open -W -n -a MarkEdit`; falls back to MarkEdit on macOS), waits for you to save and close, then persists the result.
 - **Show details** — posts the full metadata into the conversation (opt-in; it is no longer dumped automatically).
 

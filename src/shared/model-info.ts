@@ -1,4 +1,8 @@
-export const THINKING_LEVELS = ["off", "minimal", "low", "medium", "high", "xhigh"] as const;
+export const THINKING_LEVELS = ["off", "minimal", "low", "medium", "high", "xhigh", "max"] as const;
+// Legacy list offered to reasoning models that don't declare per-level metadata (pre-`max`).
+const LEGACY_THINKING_LEVELS: ThinkingLevel[] = ["off", "minimal", "low", "medium", "high", "xhigh"];
+// Levels that require an explicit thinkingLevelMap entry (a string value) to be offered.
+const EXTENDED_THINKING_LEVELS: readonly string[] = ["xhigh", "max"];
 export type ThinkingLevel = typeof THINKING_LEVELS[number];
 export type ThinkingLevelMap = Partial<Record<ThinkingLevel, string | null>>;
 
@@ -82,16 +86,17 @@ export function findModelInfo(model: string | undefined, availableModels: ModelI
 }
 
 export function getSupportedThinkingLevels(model: ModelInfo | undefined): ThinkingLevel[] {
-	if (!model) return [...THINKING_LEVELS];
+	if (!model) return [...LEGACY_THINKING_LEVELS];
 	if (model.reasoning === false) return ["off"];
+	// Without per-level metadata, keep the legacy list (through `xhigh`). `max` is only
+	// offered when a model explicitly declares it in its thinkingLevelMap.
+	if (!model.thinkingLevelMap) return [...LEGACY_THINKING_LEVELS];
 
-	if (!model.thinkingLevelMap) return [...THINKING_LEVELS];
-
-	const levels = THINKING_LEVELS.filter((level) => {
+	return THINKING_LEVELS.filter((level) => {
 		const mapped = model.thinkingLevelMap?.[level];
 		if (mapped === null) return false;
-		if (level === "xhigh") return mapped !== undefined;
+		// xhigh/max are only surfaced when the map provides a value for them.
+		if (EXTENDED_THINKING_LEVELS.includes(level)) return mapped !== undefined;
 		return true;
 	});
-	return levels;
 }
