@@ -1342,7 +1342,8 @@ describe("subagents admin slash command", { skip: !available ? "slash-commands.t
 	});
 
 	it("offers and saves max thinking only when model metadata declares it", async () => {
-		await withTempProject("pi-subagents-admin-thinking-", async (root) => {
+		await withIsolatedHome(async () => {
+			await withTempProject("pi-subagents-admin-thinking-", async (root) => {
 			const agentPath = path.join(root, ".pi", "agents", "worker.md");
 			fs.writeFileSync(agentPath, `---\nname: worker\ndescription: Test worker\nmodel: bluebox-azure-openai/gpt-5_6-sol\n---\n\nDo work.\n`, "utf-8");
 			const commands = registerAdmin([]);
@@ -1365,7 +1366,8 @@ describe("subagents admin slash command", { skip: !available ? "slash-commands.t
 					return "max";
 				},
 			}));
-			assert.match(fs.readFileSync(agentPath, "utf-8"), /^thinking: max$/m);
+				assert.match(fs.readFileSync(agentPath, "utf-8"), /^thinking: max$/m);
+			});
 		});
 	});
 

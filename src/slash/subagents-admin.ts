@@ -77,8 +77,15 @@ function buildBuiltinBase(agent: AgentConfig): BuiltinAgentOverrideBase {
 	};
 }
 
-function savesThroughSettings(agent: AgentConfig): boolean {
-	return agent.source === "builtin" || agent.source === "package" || agent.override !== undefined;
+type EditableOverrideField = "model" | "thinking" | "systemPrompt";
+
+function savesThroughSettings(agent: AgentConfig, field: EditableOverrideField): boolean {
+	if (agent.source === "builtin" || agent.source === "package") return true;
+	if (!agent.override) return false;
+	// Custom-agent overrides fill only fields absent from frontmatter. Compare the
+	// effective value with the pre-override base so an override on one field does
+	// not redirect edits to an unrelated frontmatter-owned field.
+	return agent[field] !== agent.override.base[field];
 }
 
 async function selectAgent(ctx: ExtensionContext, args: string): Promise<AgentConfig | undefined> {
@@ -172,7 +179,7 @@ async function chooseBuiltinOverrideScope(ctx: ExtensionContext, agent: AgentCon
 }
 
 async function saveAgentModel(ctx: ExtensionContext, agent: AgentConfig, selectedModel: string | undefined): Promise<string> {
-	if (savesThroughSettings(agent)) {
+	if (savesThroughSettings(agent, "model")) {
 		const scope = await chooseBuiltinOverrideScope(ctx, agent);
 		if (!scope) return "Cancelled.";
 		const base = agent.override?.base ?? buildBuiltinBase(agent);
@@ -194,7 +201,7 @@ async function saveAgentModel(ctx: ExtensionContext, agent: AgentConfig, selecte
 }
 
 async function saveAgentThinking(ctx: ExtensionContext, agent: AgentConfig, selectedThinking: string | undefined): Promise<string> {
-	if (savesThroughSettings(agent)) {
+	if (savesThroughSettings(agent, "thinking")) {
 		const scope = await chooseBuiltinOverrideScope(ctx, agent);
 		if (!scope) return "Cancelled.";
 		const base = agent.override?.base ?? buildBuiltinBase(agent);
@@ -260,7 +267,7 @@ function runEditorAndWait(editor: EditorSpec, filePath: string): Promise<void> {
 
 async function saveAgentSystemPrompt(ctx: ExtensionContext, agent: AgentConfig, systemPrompt: string): Promise<string> {
 	const nextPrompt = systemPrompt.replace(/\s+$/, "");
-	if (savesThroughSettings(agent)) {
+	if (savesThroughSettings(agent, "systemPrompt")) {
 		const scope = await chooseBuiltinOverrideScope(ctx, agent);
 		if (!scope) return "Cancelled.";
 		const base = agent.override?.base ?? buildBuiltinBase(agent);
