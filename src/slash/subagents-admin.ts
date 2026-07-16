@@ -82,6 +82,10 @@ type EditableOverrideField = "model" | "thinking" | "systemPrompt";
 function savesThroughSettings(agent: AgentConfig, field: EditableOverrideField): boolean {
 	if (agent.source === "builtin" || agent.source === "package") return true;
 	if (!agent.override) return false;
+	// A lower-scope override can flow into a higher-scope custom agent with the
+	// same name. Persist that agent's edits in its own frontmatter instead of
+	// rewriting the shared lower-scope override used by another agent.
+	if (agent.source !== agent.override.scope) return false;
 	// Custom-agent overrides fill only fields absent from frontmatter. Compare the
 	// effective value with the pre-override base so an override on one field does
 	// not redirect edits to an unrelated frontmatter-owned field.

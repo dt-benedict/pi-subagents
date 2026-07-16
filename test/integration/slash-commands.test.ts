@@ -103,13 +103,17 @@ function createState(cwd: string) {
 
 async function withIsolatedHome<T>(fn: () => Promise<T>): Promise<T> {
 	const home = fs.mkdtempSync(path.join(os.tmpdir(), "pi-slash-home-"));
+	const previousAgentDir = process.env.PI_CODING_AGENT_DIR;
 	const previousHome = process.env.HOME;
 	const previousUserProfile = process.env.USERPROFILE;
+	process.env.PI_CODING_AGENT_DIR = path.join(home, ".pi", "agent");
 	process.env.HOME = home;
 	process.env.USERPROFILE = home;
 	try {
 		return await fn();
 	} finally {
+		if (previousAgentDir === undefined) delete process.env.PI_CODING_AGENT_DIR;
+		else process.env.PI_CODING_AGENT_DIR = previousAgentDir;
 		if (previousHome === undefined) delete process.env.HOME;
 		else process.env.HOME = previousHome;
 		if (previousUserProfile === undefined) delete process.env.USERPROFILE;
@@ -1344,6 +1348,11 @@ describe("subagents admin slash command", { skip: !available ? "slash-commands.t
 	it("offers and saves max thinking only when model metadata declares it", async () => {
 		await withIsolatedHome(async () => {
 			await withTempProject("pi-subagents-admin-thinking-", async (root) => {
+			const settingsPath = path.join(process.env.PI_CODING_AGENT_DIR!, "settings.json");
+			fs.mkdirSync(path.dirname(settingsPath), { recursive: true });
+			fs.writeFileSync(settingsPath, JSON.stringify({
+				subagents: { agentOverrides: { worker: { model: "anthropic/claude-opus-4-8", thinking: "high" } } },
+			}, null, 2));
 			const agentPath = path.join(root, ".pi", "agents", "worker.md");
 			fs.writeFileSync(agentPath, `---\nname: worker\ndescription: Test worker\nmodel: bluebox-azure-openai/gpt-5_6-sol\n---\n\nDo work.\n`, "utf-8");
 			const commands = registerAdmin([]);
@@ -1367,6 +1376,10 @@ describe("subagents admin slash command", { skip: !available ? "slash-commands.t
 				},
 			}));
 				assert.match(fs.readFileSync(agentPath, "utf-8"), /^thinking: max$/m);
+				assert.deepEqual(JSON.parse(fs.readFileSync(settingsPath, "utf-8")).subagents.agentOverrides.worker, {
+					model: "anthropic/claude-opus-4-8",
+					thinking: "high",
+				});
 			});
 		});
 	});
