@@ -6,13 +6,26 @@ import * as fs from "node:fs";
 import * as path from "node:path";
 import type { Usage, SingleResult } from "./types.ts";
 import type { ChainStep } from "./settings.ts";
-import { isParallelStep } from "./settings.ts";
+import { isDynamicParallelStep, isParallelStep } from "./settings.ts";
+import { splitKnownThinkingSuffix, THINKING_LEVELS } from "./model-info.ts";
 
 /**
  * Format token count with k suffix for large numbers
  */
 export function formatTokens(n: number): string {
 	return n < 1000 ? String(n) : n < 10000 ? `${(n / 1000).toFixed(1)}k` : `${Math.round(n / 1000)}k`;
+}
+
+export function formatModelThinking(model?: string, thinking?: string): string {
+	const parsed = model ? splitKnownThinkingSuffix(model) : undefined;
+	let displayModel = parsed?.baseModel ?? model;
+	const explicitThinking = THINKING_LEVELS.find((level) => level === thinking?.trim());
+	const displayThinking = parsed?.thinkingSuffix ? parsed.thinkingSuffix.slice(1) : explicitThinking;
+	if (displayModel) {
+		const slashIdx = displayModel.lastIndexOf("/");
+		if (slashIdx !== -1) displayModel = displayModel.slice(slashIdx + 1);
+	}
+	return [displayModel, displayThinking ? `thinking ${displayThinking}` : undefined].filter(Boolean).join(" · ");
 }
 
 /**
@@ -50,7 +63,7 @@ export function buildChainSummary(
 	failedStep?: { index: number; error: string },
 ): string {
 	const stepNames = steps
-		.map((step) => (isParallelStep(step) ? `parallel[${step.parallel.length}]` : step.agent))
+		.map((step) => (isParallelStep(step) ? `parallel[${step.parallel.length}]` : isDynamicParallelStep(step) ? `expand:${step.parallel.agent}` : step.agent))
 		.join(" → ");
 
 	const totalDuration = results.reduce((sum, r) => sum + (r.progress?.durationMs || 0), 0);

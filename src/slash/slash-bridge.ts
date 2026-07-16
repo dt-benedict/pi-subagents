@@ -1,5 +1,5 @@
-import type { AgentToolResult } from "@mariozechner/pi-agent-core";
-import type { ExtensionContext } from "@mariozechner/pi-coding-agent";
+import type { AgentToolResult } from "@earendil-works/pi-agent-core";
+import type { ExtensionContext } from "@earendil-works/pi-coding-agent";
 import type { SubagentParamsLike } from "../runs/foreground/subagent-executor.ts";
 import {
 	SLASH_SUBAGENT_CANCEL_EVENT,
@@ -13,6 +13,8 @@ import {
 interface SlashSubagentRequest {
 	requestId: string;
 	params: SubagentParamsLike;
+	/** Optional requester context for in-process extension bridge calls. */
+	ctx?: ExtensionContext;
 }
 
 export interface SlashSubagentResponse {
@@ -77,7 +79,7 @@ export function registerSlashSubagentBridge(options: SlashBridgeOptions): {
 		if (typeof request.requestId !== "string" || !request.params) return;
 		const { requestId, params } = request as SlashSubagentRequest;
 
-		const ctx = options.getContext();
+		const ctx = request.ctx ?? options.getContext();
 		if (!ctx) {
 			const response: SlashSubagentResponse = {
 				requestId,

@@ -49,6 +49,7 @@ interface AgentConfig {
 	fallbackModels?: string[];
 	tools?: string[];
 	extensions?: string[];
+	subagentOnlyExtensions?: string[];
 	skills?: string[];
 	thinking?: string;
 	systemPromptMode?: string;
@@ -60,6 +61,7 @@ interface AgentConfig {
 	progress?: boolean;
 	mcpDirectTools?: string[];
 	maxSubagentDepth?: number;
+	completionGuard?: boolean;
 }
 
 export function makeAgentConfigs(names: string[]): AgentConfig[] {
@@ -96,7 +98,7 @@ interface MinimalCtx {
 	modelRegistry: {
 		getAvailable: () => Array<{ provider: string; id: string }>;
 	};
-	model?: { provider: string };
+	model?: { provider: string; id?: string };
 }
 
 export function makeMinimalCtx(cwd: string): MinimalCtx {

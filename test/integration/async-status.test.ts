@@ -53,6 +53,35 @@ describe("async status helpers", () => {
 		}
 	});
 
+	it("formats model thinking in step summaries", () => {
+		const root = fs.mkdtempSync(path.join(os.tmpdir(), "pi-async-status-model-thinking-"));
+		try {
+			createAsyncDir(root, "run-model", {
+				runId: "run-model",
+				mode: "parallel",
+				state: "running",
+				startedAt: 100,
+				lastUpdate: 200,
+				steps: [
+					{ agent: "reviewer", status: "running", model: "openai-codex/gpt-5.5:high" },
+					{ agent: "scout", status: "running", model: "anthropic/claude-haiku-4-5", thinking: "low" },
+					{ agent: "local", status: "running", model: "ollama/qwen2.5-coder:7b" },
+					{ agent: "fallback", status: "running", model: "anthropic/claude-sonnet-4-5:low", thinking: "high" },
+				],
+			});
+
+			const text = formatAsyncRunList(listAsyncRuns(root, { states: ["running"] }));
+			assert.match(text, /1\. reviewer \| running \| gpt-5\.5 · thinking high/);
+			assert.match(text, /2\. scout \| running \| claude-haiku-4-5 · thinking low/);
+			assert.match(text, /3\. local \| running \| qwen2\.5-coder:7b(?! · thinking)/);
+			assert.match(text, /4\. fallback \| running \| claude-sonnet-4-5 · thinking low/);
+			assert.doesNotMatch(text, /openai-codex\/gpt-5\.5/);
+			assert.doesNotMatch(text, /gpt-5\.5:high/);
+		} finally {
+			fs.rmSync(root, { recursive: true, force: true });
+		}
+	});
+
 	it("uses persisted running attention state from detached runners", () => {
 		const root = fs.mkdtempSync(path.join(os.tmpdir(), "pi-async-running-state-"));
 		try {
@@ -396,6 +425,37 @@ describe("async status helpers", () => {
 			});
 			const text = formatAsyncRunList(listAsyncRuns(root, { states: ["running"] }));
 			assert.match(text, /step 1\/2/);
+		} finally {
+			fs.rmSync(root, { recursive: true, force: true });
+		}
+	});
+
+	it("filters terminal runs to active states without scanning nested routes per run", () => {
+		// Regression guard: load-time restoration calls listAsyncRuns with a
+		// queued/running filter over every run dir on disk. The nested-route
+		// lookup must be skipped for runs that fail the state filter, otherwise
+		// session start freezes when many stale run dirs have accumulated.
+		const root = fs.mkdtempSync(path.join(os.tmpdir(), "pi-async-status-filter-"));
+		try {
+			for (let i = 0; i < 200; i++) {
+				createAsyncDir(root, `run-${i}`, {
+					runId: `run-${i}`,
+					mode: "single",
+					state: "complete",
+					startedAt: 100,
+					lastUpdate: 200,
+					steps: [{ agent: "reviewer", status: "complete" }],
+				});
+			}
+
+			const start = Date.now();
+			const runs = listAsyncRuns(root, { states: ["queued", "running"] });
+			const elapsed = Date.now() - start;
+
+			assert.equal(runs.length, 0);
+			// 200 terminal dirs filtered to active states should resolve in well
+			// under a second. The old per-run nested-route scan blew past this.
+			assert.ok(elapsed < 1000, `listAsyncRuns took ${elapsed}ms for 200 terminal runs`);
 		} finally {
 			fs.rmSync(root, { recursive: true, force: true });
 		}

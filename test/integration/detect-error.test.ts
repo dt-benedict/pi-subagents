@@ -139,28 +139,45 @@ describe("detectSubagentError", { skip: !available ? "utils not importable" : un
 			"fatal pattern before agent's text response = recovered");
 	});
 
-	// ---- Errors AFTER the last assistant text response are still caught ----
+	// ---- Trailing tool errors are forgiven once the agent has delivered ----
+	// These previously produced false positives that killed otherwise-successful
+	// runs (esp. in parallel mode) whenever a trailing exploratory/verification
+	// tool call errored after the agent had already produced its answer.
 
-	it("detects error after agent's last text response", () => {
+	it("forgives a bash error that follows the agent's answer", () => {
 		const messages = [
 			assistantMsg("Here is my analysis..."),
 			toolResult("bash", "rm -rf /important", false),
 			toolResult("bash", "error: process exited with code 1", false),
 		];
 		const result = detectSubagentError(messages);
-		assert.equal(result.hasError, true);
-		assert.equal(result.exitCode, 1);
+		assert.equal(result.hasError, false,
+			"a trailing tool error after the agent delivered output is not run-fatal");
 	});
 
-	it("detects isError after agent's last text response", () => {
+	it("forgives a trailing isError tool result when the agent produced output", () => {
 		const messages = [
 			toolResult("read", "file ok"),
 			assistantMsg("Let me try one more thing..."),
 			toolResult("write", "Permission denied", true),
 		];
 		const result = detectSubagentError(messages);
-		assert.equal(result.hasError, true);
-		assert.equal(result.errorType, "write");
+		assert.equal(result.hasError, false,
+			"agent delivered text before the failed write — not a run failure");
+	});
+
+	it("regression: trailing read ENOENT after a full report is not fatal", () => {
+		// The exact parallel-mode false positive: agent produced a substantive
+		// report, then a trailing verification read hit a missing path (or a find
+		// spawn ENOEXEC / bash abort), then the loop ended. Must NOT be flagged.
+		const messages = [
+			toolResult("bash", "grep results ..."),
+			assistantMsg("## Investigation\n\n" + "findings ".repeat(200)),
+			toolResult("read", "ENOENT: no such file or directory", true),
+		];
+		const result = detectSubagentError(messages);
+		assert.equal(result.hasError, false,
+			"trailing read ENOENT after a delivered report must not fail the run");
 	});
 
 	// ---- Edge cases ----

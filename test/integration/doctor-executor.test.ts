@@ -89,7 +89,7 @@ describe("doctor action executor routing", { skip: !createSubagentExecutor ? "ex
 		const text = result.content[0]?.text ?? "";
 		assert.match(text, /^Subagents doctor report/);
 		assert.match(text, /- configured session dir: .*configured-sessions/);
-		assert.match(text, /- pi-intercom: unavailable /);
+		assert.match(text, /- supervisor channel: available \(native:pi-subagents-supervisor-channel\)/);
 	});
 
 	it("reports session manager failures without failing the doctor action", async () => {

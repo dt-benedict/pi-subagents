@@ -9,6 +9,7 @@ interface MockPiResponse {
 	exitCode?: number;
 	delay?: number;
 	keepAliveAfterFinalMessageMs?: number;
+	ignoreSigterm?: boolean;
 	jsonl?: unknown[];
 	steps?: Array<{
 		delay?: number;
@@ -16,6 +17,7 @@ interface MockPiResponse {
 		stderr?: string;
 	}>;
 	echoEnv?: string[];
+	matchArgIncludes?: string | string[];
 }
 
 export interface MockPi {

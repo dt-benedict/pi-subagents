@@ -1,6 +1,6 @@
 import assert from "node:assert/strict";
 import { describe, it } from "node:test";
-import { findModelInfo, getSupportedThinkingLevels, type ModelInfo } from "../../src/shared/model-info.ts";
+import { findModelInfo, getLiveAvailableModels, getSupportedThinkingLevels, type ModelInfo } from "../../src/shared/model-info.ts";
 
 describe("model info helpers", () => {
 	const ambiguousModels: ModelInfo[] = [
@@ -58,5 +58,32 @@ describe("model info helpers", () => {
 			}),
 			["high"],
 		);
+	});
+
+	it("offers max only when the model explicitly declares it", () => {
+		assert.deepEqual(
+			getSupportedThinkingLevels({
+				provider: "bluebox-azure-openai",
+				id: "gpt-5_6-sol",
+				fullId: "bluebox-azure-openai/gpt-5_6-sol",
+				reasoning: true,
+				thinkingLevelMap: { minimal: null, xhigh: "xhigh", max: "max" },
+			}),
+			["off", "low", "medium", "high", "xhigh", "max"],
+		);
+	});
+
+	it("refreshes the model registry before reading and tolerates refresh failures", () => {
+		let available = ["old"];
+		let refreshes = 0;
+		const registry = {
+			refresh: () => { refreshes++; available = ["new"]; },
+			getAvailable: () => available,
+		};
+		assert.deepEqual(getLiveAvailableModels(registry), ["new"]);
+		assert.equal(refreshes, 1);
+
+		registry.refresh = () => { throw new Error("partial models.json write"); };
+		assert.deepEqual(getLiveAvailableModels(registry), ["new"]);
 	});
 });

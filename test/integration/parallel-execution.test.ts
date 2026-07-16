@@ -171,6 +171,26 @@ describe("parallel agent execution", { skip: !piAvailable ? "pi packages not ava
 		assert.equal(ok, 2);
 	});
 
+	it("treats parallel action aliases with tasks as top-level parallel execution", { skip: !createSubagentExecutor ? "executor not importable" : undefined }, async () => {
+		for (const action of ["parallel", "PARALLEL", "tasks"]) {
+			mockPi.reset();
+			mockPi.onCall({ output: `${action} alias finished` });
+			const executor = makeExecutor();
+
+			const result = await executor.execute(
+				`parallel-alias-${action}`,
+				{ action, tasks: [{ agent: "echo", task: `Run ${action}` }] },
+				new AbortController().signal,
+				undefined,
+				makeMinimalCtx(tempDir),
+			);
+
+			assert.equal(result.isError, undefined);
+			assert.equal(result.details?.mode, "parallel");
+			assert.match(result.content[0]?.text ?? "", new RegExp(`${action} alias finished`));
+		}
+	});
+
 	it("top-level parallel output saves use per-task output paths", { skip: !createSubagentExecutor ? "executor not importable" : undefined }, async () => {
 		mockPi.onCall({ output: "Saved report" });
 		const executor = makeExecutor();
@@ -183,10 +203,45 @@ describe("parallel agent execution", { skip: !piAvailable ? "pi packages not ava
 			makeMinimalCtx(tempDir),
 		);
 
-		const outputPath = path.join(tempDir, "parallel-output.md");
+		const runId = result.details?.runId;
+		assert.ok(runId, "expected run id in details");
+		const outputPath = path.join(tempDir, ".pi-subagents", "artifacts", "outputs", runId, "parallel-output.md");
 		assert.equal(result.isError, undefined);
 		assert.equal(fs.readFileSync(outputPath, "utf-8"), "Saved report");
 		assert.equal(result.details?.results?.[0]?.savedOutputPath, outputPath);
+	});
+
+	it("top-level parallel preserves completed siblings and marks timed-out children", { skip: !createSubagentExecutor ? "executor not importable" : process.platform === "win32" ? "timeout signal delivery intermittent on Windows CI" : undefined }, async () => {
+		mockPi.onCall({ matchArgIncludes: "Slow review", delay: 10000 });
+		mockPi.onCall({ matchArgIncludes: "Fast review", output: "fast done" });
+		const executor = makeExecutor();
+
+		const start = Date.now();
+		const result = await executor.execute(
+			"parallel-timeout",
+			{
+				tasks: [
+					{ agent: "echo", task: "Slow review" },
+					{ agent: "echo", task: "Fast review" },
+				],
+				concurrency: 2,
+				maxRuntimeMs: 300,
+			},
+			new AbortController().signal,
+			undefined,
+			makeMinimalCtx(tempDir),
+		);
+		const elapsed = Date.now() - start;
+
+		assert.ok(elapsed < 5000, `should time out early, took ${elapsed}ms`);
+		assert.equal(result.isError, undefined);
+		assert.equal(result.details?.results?.length, 2);
+		assert.equal(result.details?.results?.[0]?.timedOut, true);
+		assert.equal(result.details?.results?.[0]?.error, "Subagent timed out after 300ms.");
+		assert.equal(result.details?.results?.[1]?.exitCode, 0);
+		assert.equal(result.details?.results?.[1]?.finalOutput, "fast done");
+		assert.match(result.content[0]?.text ?? "", /1\/2 succeeded/);
+		assert.match(result.content[0]?.text ?? "", /TIMED OUT: Subagent timed out after 300ms\./);
 	});
 
 	it("top-level parallel file-only output aggregates concise file references", { skip: !createSubagentExecutor ? "executor not importable" : undefined }, async () => {
@@ -201,7 +256,9 @@ describe("parallel agent execution", { skip: !piAvailable ? "pi packages not ava
 			makeMinimalCtx(tempDir),
 		);
 
-		const outputPath = path.join(tempDir, "parallel-file-only.md");
+		const runId = result.details?.runId;
+		assert.ok(runId, "expected run id in details");
+		const outputPath = path.join(tempDir, ".pi-subagents", "artifacts", "outputs", runId, "parallel-file-only.md");
 		const text = result.content[0]?.text ?? "";
 		assert.equal(result.isError, undefined);
 		assert.match(text, /Output saved to:/);
@@ -284,26 +341,41 @@ describe("parallel agent execution", { skip: !piAvailable ? "pi packages not ava
 		);
 
 		const args = readLastCallArgs();
-		assert.equal(args.at(-1), `Task: [Read from: ${path.join(tempDir, "a.md")}, ${path.join(tempDir, "b.md")}]
+		const taskArg = args.at(-1) ?? "";
+		assert.ok(taskArg.startsWith(`Task: [Read from: ${path.join(tempDir, "a.md")}, ${path.join(tempDir, "b.md")}]
 
-Inspect`);
+Inspect
+
+## Acceptance Contract`));
 	});
 
-	it("top-level parallel progress emits the existing progress instruction style", { skip: !createSubagentExecutor ? "executor not importable" : undefined }, async () => {
+	it("top-level parallel defaultProgress uses isolated run storage", { skip: !createSubagentExecutor ? "executor not importable" : undefined }, async () => {
 		mockPi.onCall({ output: "Progress done" });
-		const executor = makeExecutor();
+		const executor = makeExecutor([makeAgent("echo", { defaultProgress: true })]);
+		const parentSessionFile = path.join(tempDir, "parent-session.jsonl");
 
-		await executor.execute(
+		const result = await executor.execute(
 			"parallel-progress",
-			{ tasks: [{ agent: "echo", task: "Track work", progress: true }] },
+			{ tasks: [{ agent: "echo", task: "Track work" }] },
 			new AbortController().signal,
 			undefined,
-			makeMinimalCtx(tempDir),
+			{
+				...makeMinimalCtx(tempDir),
+				sessionManager: {
+					getSessionId: () => "session-123",
+					getSessionFile: () => parentSessionFile,
+				},
+			},
 		);
+		const runId = result.details?.runId;
+		assert.ok(runId, "expected run id in details");
+		const expectedProgressPath = path.join(tempDir, ".pi-subagents", "artifacts", "progress", runId, "progress.md");
 
 		const args = readLastCallArgs();
-		assert.ok((args.at(-1) ?? "").includes(`Update progress at: ${path.join(tempDir, "progress.md")}`));
-		assert.equal(fs.existsSync(path.join(tempDir, "progress.md")), true);
+		const taskArg = args.at(-1) ?? "";
+		assert.ok(taskArg.includes(`Update progress at: ${expectedProgressPath}`), taskArg);
+		assert.equal(fs.existsSync(expectedProgressPath), true);
+		assert.equal(fs.existsSync(path.join(tempDir, "progress.md")), false);
 	});
 
 	it("top-level parallel suppresses progress when the task is review-only", { skip: !createSubagentExecutor ? "executor not importable" : undefined }, async () => {
