@@ -1373,11 +1373,11 @@ describe("subagents admin slash command", { skip: !available ? "slash-commands.t
 		await withTempProject("pi-subagents-admin-prompt-", async (root) => {
 			const agentPath = path.join(root, ".pi", "agents", "worker.md");
 			fs.writeFileSync(agentPath, `---\nname: worker\ndescription: Test worker\n---\n\nOriginal prompt.\n`, "utf-8");
-			const editorPath = path.join(root, "edit-prompt.sh");
-			fs.writeFileSync(editorPath, `#!/bin/sh\nprintf '\\nEdited by test.' >> "$1"\n`, { mode: 0o755 });
+			const editorPath = path.join(root, "edit-prompt.cjs");
+			fs.writeFileSync(editorPath, `const fs = require("node:fs");\nfs.appendFileSync(process.argv[2], "\\nEdited by test.");\n`);
 			const previousEditor = process.env.EDITOR;
 			const previousVisual = process.env.VISUAL;
-			process.env.EDITOR = editorPath;
+			process.env.EDITOR = `${process.execPath} ${editorPath}`;
 			delete process.env.VISUAL;
 			try {
 				const commands = registerAdmin([]);
