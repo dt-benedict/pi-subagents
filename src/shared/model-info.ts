@@ -1,13 +1,12 @@
 export const THINKING_LEVELS = ["off", "minimal", "low", "medium", "high", "xhigh", "max"] as const;
 export type ThinkingLevel = typeof THINKING_LEVELS[number];
 export type ThinkingLevelMap = Partial<Record<ThinkingLevel, string | null>>;
-const LEGACY_THINKING_LEVELS: ThinkingLevel[] = ["off", "minimal", "low", "medium", "high", "xhigh"];
-const EXTENDED_THINKING_LEVELS: readonly ThinkingLevel[] = ["xhigh", "max"];
 
 export interface ModelInfo {
 	provider: string;
 	id: string;
 	fullId: string;
+	api?: string;
 	reasoning?: boolean;
 	thinkingLevelMap?: ThinkingLevelMap;
 }
@@ -15,23 +14,9 @@ export interface ModelInfo {
 interface RegistryModelLike {
 	provider: string;
 	id: string;
+	api?: string;
 	reasoning?: boolean;
 	thinkingLevelMap?: ThinkingLevelMap;
-}
-
-export interface LiveModelRegistry<M> {
-	refresh?: () => void;
-	getAvailable: () => M[];
-}
-
-/** Refresh models.json before reading the registry; fall back to its last good snapshot on refresh errors. */
-export function getLiveAvailableModels<M>(modelRegistry: LiveModelRegistry<M>): M[] {
-	try {
-		modelRegistry.refresh?.();
-	} catch {
-		// A transient/partial models.json write must not break subagent execution.
-	}
-	return modelRegistry.getAvailable();
 }
 
 export function toModelInfo(model: RegistryModelLike): ModelInfo {
@@ -39,6 +24,7 @@ export function toModelInfo(model: RegistryModelLike): ModelInfo {
 		provider: model.provider,
 		id: model.id,
 		fullId: `${model.provider}/${model.id}`,
+		api: model.api,
 		reasoning: model.reasoning,
 		thinkingLevelMap: model.thinkingLevelMap,
 	};
@@ -80,14 +66,16 @@ export function findModelInfo(model: string | undefined, availableModels: ModelI
 }
 
 export function getSupportedThinkingLevels(model: ModelInfo | undefined): ThinkingLevel[] {
-	if (!model) return [...LEGACY_THINKING_LEVELS];
+	if (!model) return THINKING_LEVELS.filter((level) => level !== "max");
 	if (model.reasoning === false) return ["off"];
-	if (!model.thinkingLevelMap) return [...LEGACY_THINKING_LEVELS];
 
-	return THINKING_LEVELS.filter((level) => {
+	if (!model.thinkingLevelMap) return THINKING_LEVELS.filter((level) => level !== "max");
+
+	const levels = THINKING_LEVELS.filter((level) => {
 		const mapped = model.thinkingLevelMap?.[level];
 		if (mapped === null) return false;
-		if (EXTENDED_THINKING_LEVELS.includes(level)) return mapped !== undefined;
+		if (level === "xhigh" || level === "max") return mapped !== undefined;
 		return true;
 	});
+	return levels;
 }

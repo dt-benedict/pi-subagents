@@ -167,6 +167,32 @@ function defaultResponse() {
 	return { output: "ok", exitCode: 0 };
 }
 
+function writeDeclaredFiles(response) {
+	if (!Array.isArray(response.writeFiles)) return;
+	for (const file of response.writeFiles) {
+		if (!file || typeof file.path !== "string" || typeof file.content !== "string") continue;
+		const target = path.resolve(process.cwd(), file.path);
+		fs.mkdirSync(path.dirname(target), { recursive: true });
+		fs.writeFileSync(target, file.content, "utf-8");
+	}
+}
+
+function writeToolDiagnostic(response) {
+	if (!Array.isArray(response.missingTools) || response.missingTools.length === 0) return;
+	const diagnosticPath = process.env.PI_SUBAGENT_TOOL_DIAGNOSTIC_PATH;
+	const required = JSON.parse(process.env.PI_SUBAGENT_REQUIRED_TOOLS ?? "[]");
+	if (!diagnosticPath || !Array.isArray(required)) return;
+	const missing = response.missingTools.filter((name) => typeof name === "string" && required.includes(name));
+	const available = required.filter((name) => !missing.includes(name));
+	fs.mkdirSync(path.dirname(diagnosticPath), { recursive: true });
+	fs.writeFileSync(diagnosticPath, JSON.stringify({
+		agent: process.env.PI_SUBAGENT_CHILD_AGENT,
+		required,
+		available,
+		missing,
+	}), "utf-8");
+}
+
 function isJsonMode(args) {
 	for (let i = 0; i < args.length; i++) {
 		if (args[i] === "--mode") {
@@ -218,6 +244,15 @@ async function writeStdout(text) {
 async function writeJsonlLine(entry) {
 	const line = typeof entry === "string" ? entry : JSON.stringify(entry);
 	await writeStdout(`${line}\n`);
+}
+
+async function writeRawStdout(entry) {
+	if (Array.isArray(entry?.stdoutBase64Chunks)) {
+		for (const chunk of entry.stdoutBase64Chunks) {
+			if (typeof chunk === "string") await writeStdout(Buffer.from(chunk, "base64"));
+		}
+	}
+	if (typeof entry?.stdoutRaw === "string") await writeStdout(entry.stdoutRaw);
 }
 
 function extractPlainText(entry) {
@@ -283,6 +318,7 @@ async function main() {
 		process.on("SIGTERM", () => {});
 	}
 	writeSessionFile(args);
+	writeToolDiagnostic(response);
 	fs.writeFileSync(
 		path.join(queueDir, `call-${Date.now()}-${process.pid}-${Math.random().toString(16).slice(2)}.json`),
 		JSON.stringify({ args, systemPrompts: readSystemPromptRecords(args) }),
@@ -292,6 +328,15 @@ async function main() {
 	if (typeof response.delay === "number" && response.delay > 0) {
 		await new Promise((resolve) => setTimeout(resolve, response.delay));
 	}
+	if (typeof response.waitForPath === "string") {
+		const deadline = Date.now() + 30_000;
+		while (!fs.existsSync(response.waitForPath)) {
+			if (Date.now() >= deadline) fail(`Timed out waiting for mock release path: ${response.waitForPath}`);
+			await new Promise((resolve) => setTimeout(resolve, 20));
+		}
+	}
+
+	writeDeclaredFiles(response);
 
 	if (Array.isArray(response.steps) && response.steps.length > 0) {
 		for (const step of response.steps) {
@@ -299,14 +344,17 @@ async function main() {
 				await new Promise((resolve) => setTimeout(resolve, step.delay));
 				}
 				if (Array.isArray(step?.jsonl) && step.jsonl.length > 0) {
-						await writeResponseEntries(step.jsonl, jsonMode, args);
+					await writeResponseEntries(step.jsonl, jsonMode, args);
 				}
+				await writeRawStdout(step);
 				if (typeof step?.stderr === "string" && step.stderr.length > 0) {
 					process.stderr.write(step.stderr);
 				}
 			}
 		} else if (Array.isArray(response.jsonl) && response.jsonl.length > 0) {
-				await writeResponseEntries(response.jsonl, jsonMode, args);
+			await writeResponseEntries(response.jsonl, jsonMode, args);
+		} else if (Array.isArray(response.stdoutBase64Chunks) || typeof response.stdoutRaw === "string") {
+			await writeRawStdout(response);
 		} else if (Array.isArray(response.echoEnv) && response.echoEnv.length > 0) {
 			const envSnapshot = Object.fromEntries(response.echoEnv.map((key) => [key, process.env[key] ?? null]));
 				const output = withAcceptanceReport(JSON.stringify(envSnapshot), args);

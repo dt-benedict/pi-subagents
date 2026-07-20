@@ -6,8 +6,12 @@ import { encodeNestedPathEnv, parseNestedPathEnv, type NestedPathEntry } from ".
 import { resolveMcpDirectToolNames } from "./mcp-direct-tool-allowlist.ts";
 import { STRUCTURED_OUTPUT_CAPTURE_ENV, STRUCTURED_OUTPUT_SCHEMA_ENV } from "./structured-output.ts";
 import { TEMP_ROOT_DIR, type JsonSchemaObject, type ResolvedToolBudget } from "../../shared/types.ts";
-import { TOOL_BUDGET_ENV, encodeToolBudgetEnv } from "./tool-budget.ts";
 import { THINKING_LEVELS } from "../../shared/model-info.ts";
+import { TOOL_BUDGET_ENV, encodeToolBudgetEnv } from "./tool-budget.ts";
+import { CHILD_TOOL_DIAGNOSTIC_PATH_ENV, REQUIRED_CHILD_TOOLS_ENV } from "./tool-availability.ts";
+import { CHILD_WATCHDOG_CONFIG_ENV, encodeChildWatchdogConfig, type ChildWatchdogConfig } from "../../watchdog/child-status.ts";
+import { WAIT_TOOL_ENABLED_ENV } from "../background/wait-config.ts";
+
 const TASK_ARG_LIMIT = 8000;
 const PROMPT_RUNTIME_EXTENSION_PATH = path.join(path.dirname(fileURLToPath(import.meta.url)), "subagent-prompt-runtime.ts");
 const FANOUT_CHILD_EXTENSION_PATH = path.join(path.dirname(fileURLToPath(import.meta.url)), "..", "..", "extension", "fanout-child.ts");
@@ -29,6 +33,8 @@ export const SUBAGENT_PARENT_PATH_ENV = "PI_SUBAGENT_PARENT_PATH";
 export const SUBAGENT_PARENT_CAPABILITY_TOKEN_ENV = "PI_SUBAGENT_PARENT_CAPABILITY_TOKEN";
 export const SUBAGENT_PARENT_SESSION_ENV = "PI_SUBAGENT_PARENT_SESSION";
 export const SUBAGENT_STEER_INBOX_ENV = "PI_SUBAGENT_STEER_INBOX";
+export const SUBAGENT_STEER_CAPABILITY_ENV = "PI_SUBAGENT_STEER_CAPABILITY";
+export const SUBAGENT_STEER_ACK_DIR_ENV = "PI_SUBAGENT_STEER_ACK_DIR";
 
 interface BuildPiArgsInput {
 	parentSessionId?: string;
@@ -64,18 +70,23 @@ interface BuildPiArgsInput {
 	parentPath?: NestedPathEntry[];
 	parentCapabilityToken?: string;
 	steerInboxDir?: string;
+	steerCapabilityPath?: string;
+	steerAckDir?: string;
 	structuredOutput?: {
 		schema: JsonSchemaObject;
 		schemaPath: string;
 		outputPath: string;
 	};
 	toolBudget?: ResolvedToolBudget;
+	childWatchdog?: ChildWatchdogConfig;
+	waitToolEnabled?: boolean;
 }
 
 interface BuildPiArgsResult {
 	args: string[];
 	env: Record<string, string | undefined>;
 	tempDir?: string;
+	toolDiagnosticPath?: string;
 }
 
 function sanitizeSupervisorChannelSegment(value: string): string {
@@ -89,7 +100,7 @@ function supervisorChannelDir(runId: string, agent: string, childIndex: number):
 export function applyThinkingSuffix(model: string | undefined, thinking: string | false | undefined, replaceExisting = false): string | undefined {
 	if (!model || !thinking) return model;
 	const colonIdx = model.lastIndexOf(":");
-	if (colonIdx !== -1 && THINKING_LEVELS.includes(model.substring(colonIdx + 1))) {
+	if (colonIdx !== -1 && THINKING_LEVELS.some((level) => level === model.substring(colonIdx + 1))) {
 		return replaceExisting ? `${model.slice(0, colonIdx)}:${thinking}` : model;
 	}
 	return `${model}:${thinking}`;
@@ -122,18 +133,21 @@ export function buildPiArgs(input: BuildPiArgsInput): BuildPiArgsResult {
 		: declaredBuiltinToolsBase;
 	const fanoutAuthorized = declaredBuiltinTools.includes("subagent");
 	const toolExtensionPaths: string[] = [];
+	let requiredChildTools: string[] = [];
 	if (input.tools?.length) {
-		const builtinTools = [...declaredBuiltinTools];
+		const allowedTools = [...declaredBuiltinTools];
 		for (const tool of input.tools) {
 			if (!declaredBuiltinTools.includes(tool) && (tool.includes("/") || tool.endsWith(".ts") || tool.endsWith(".js"))) {
 				toolExtensionPaths.push(tool);
 			}
 		}
-		if (builtinTools.length > 0) {
+		if (allowedTools.length > 0) {
 			if (input.mcpDirectTools?.length) {
-				builtinTools.push(...resolveMcpDirectToolNames(input.mcpDirectTools, input.cwd));
+				allowedTools.push(...resolveMcpDirectToolNames(input.mcpDirectTools, input.cwd));
 			}
-			args.push("--tools", builtinTools.join(","));
+			if (input.structuredOutput) allowedTools.push("structured_output");
+			requiredChildTools = [...new Set(allowedTools)];
+			args.push("--tools", requiredChildTools.join(","));
 		}
 	}
 
@@ -176,8 +190,18 @@ export function buildPiArgs(input: BuildPiArgsInput): BuildPiArgsResult {
 	}
 
 	const env: Record<string, string | undefined> = {};
+	let toolDiagnosticPath: string | undefined;
+	if (requiredChildTools.length > 0) {
+		if (!tempDir) tempDir = fs.mkdtempSync(path.join(os.tmpdir(), "pi-subagent-"));
+		toolDiagnosticPath = path.join(tempDir, "tool-diagnostic.json");
+		env[REQUIRED_CHILD_TOOLS_ENV] = JSON.stringify(requiredChildTools);
+		env[CHILD_TOOL_DIAGNOSTIC_PATH_ENV] = toolDiagnosticPath;
+	}
 	env[SUBAGENT_CHILD_ENV] = "1";
 	env[SUBAGENT_FANOUT_CHILD_ENV] = fanoutAuthorized ? "1" : "0";
+	if (input.waitToolEnabled !== undefined) {
+		env[WAIT_TOOL_ENABLED_ENV] = input.waitToolEnabled ? "true" : "false";
+	}
 	const inheritedNestedRoute = Boolean(process.env[SUBAGENT_PARENT_EVENT_SINK_ENV] && process.env[SUBAGENT_PARENT_ROOT_RUN_ID_ENV] && process.env[SUBAGENT_PARENT_CAPABILITY_TOKEN_ENV]);
 	const parentRunId = input.parentRunId ?? input.runId ?? (inheritedNestedRoute ? process.env[SUBAGENT_RUN_ID_ENV] : undefined) ?? process.env[SUBAGENT_PARENT_RUN_ID_ENV] ?? "";
 	const parentChildIndex = input.parentChildIndex !== undefined
@@ -250,12 +274,16 @@ export function buildPiArgs(input: BuildPiArgsInput): BuildPiArgsResult {
 	if (input.steerInboxDir) {
 		env[SUBAGENT_STEER_INBOX_ENV] = input.steerInboxDir;
 	}
+	if (input.steerCapabilityPath) env[SUBAGENT_STEER_CAPABILITY_ENV] = input.steerCapabilityPath;
+	if (input.steerAckDir) env[SUBAGENT_STEER_ACK_DIR_ENV] = input.steerAckDir;
 	const encodedToolBudget = encodeToolBudgetEnv(input.toolBudget);
 	if (encodedToolBudget) env[TOOL_BUDGET_ENV] = encodedToolBudget;
+	const encodedChildWatchdog = encodeChildWatchdogConfig(input.childWatchdog);
+	if (encodedChildWatchdog) env[CHILD_WATCHDOG_CONFIG_ENV] = encodedChildWatchdog;
 
 	env[SUBAGENT_PARENT_SESSION_ENV] = input.parentSessionId ?? process.env[SUBAGENT_PARENT_SESSION_ENV] ?? "";
 
-	return { args, env, tempDir };
+	return { args, env, tempDir, toolDiagnosticPath };
 }
 
 export const parseParentPathEnv = parseNestedPathEnv;

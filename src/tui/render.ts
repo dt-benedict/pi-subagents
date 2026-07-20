@@ -268,6 +268,7 @@ function firstOutputLine(text: string): string {
 
 function resultStatusLine(result: Details["results"][number], output: string): string {
 	if (result.detached) return result.detachedReason ? `Detached: ${result.detachedReason}` : "Detached";
+	if (result.stopped) return "Stopped";
 	if (result.interrupted) return "Paused";
 	if (result.exitCode !== 0) return `Error: ${result.error ?? (firstOutputLine(output) || `exit ${result.exitCode}`)}`;
 	if (result.acceptance?.status && result.acceptance.status !== "not-required") return `Done · acceptance: ${result.acceptance.status}`;
@@ -281,6 +282,7 @@ function resultGlyph(result: Details["results"][number], output: string, theme: 
 		return theme.fg("accent", runningGlyph(seed));
 	}
 	if (result.detached) return theme.fg("warning", "■");
+	if (result.stopped) return theme.fg("warning", "■");
 	if (result.interrupted) return theme.fg("warning", "■");
 	if (result.exitCode !== 0) return theme.fg("error", "✗");
 	if (hasEmptyTextOutputWithoutOutputTarget(result.task, output)) return theme.fg("warning", "✓");
@@ -349,6 +351,7 @@ function widgetActivity(job: AsyncJobState): string {
 	if (job.status === "running") return "thinking…";
 	if (job.status === "queued") return "queued…";
 	if (job.status === "paused") return "Paused";
+	if (job.status === "stopped") return "Stopped";
 	if (job.status === "failed") return "Failed";
 	return "Done";
 }
@@ -397,6 +400,7 @@ function widgetStatusGlyph(job: AsyncJobState, theme: Theme): string {
 	if (job.status === "queued") return theme.fg("muted", "◦");
 	if (job.status === "complete") return theme.fg("success", "✓");
 	if (job.status === "paused") return theme.fg("warning", "■");
+	if (job.status === "stopped") return theme.fg("warning", "■");
 	return theme.fg("error", "✗");
 }
 
@@ -405,6 +409,7 @@ function widgetStepGlyph(status: AsyncJobStep["status"], theme: Theme, seed?: nu
 	if (status === "complete" || status === "completed") return theme.fg("success", "✓");
 	if (status === "failed") return theme.fg("error", "✗");
 	if (status === "paused") return theme.fg("warning", "■");
+	if (status === "stopped") return theme.fg("warning", "■");
 	return theme.fg("muted", "◦");
 }
 
@@ -413,6 +418,7 @@ function widgetStepStatus(status: AsyncJobStep["status"], theme: Theme): string 
 	if (status === "complete" || status === "completed") return theme.fg("success", "complete");
 	if (status === "failed") return theme.fg("error", "failed");
 	if (status === "paused") return theme.fg("warning", "paused");
+	if (status === "stopped") return theme.fg("warning", "stopped");
 	return theme.fg("dim", status);
 }
 
@@ -620,7 +626,7 @@ function buildMultiProgressLabel(details: Pick<Details, "mode" | "results" | "pr
 
 	if (details.mode === "parallel") {
 		const totalCount = details.totalSteps ?? details.results.length;
-		const statuses = new Array(totalCount).fill("pending") as Array<"pending" | "running" | "completed" | "failed" | "detached">;
+		const statuses = new Array(totalCount).fill("pending") as Array<"pending" | "running" | "completed" | "failed" | "stopped" | "detached">;
 		for (const progress of details.progress ?? []) {
 			if (progress.index >= 0 && progress.index < totalCount) statuses[progress.index] = progress.status;
 		}
@@ -631,11 +637,13 @@ function buildMultiProgressLabel(details: Pick<Details, "mode" | "results" | "pr
 			const index = result.progress?.index ?? progressFromArray?.index ?? i;
 			if (index < 0 || index >= totalCount) continue;
 			const status = result.progress?.status
-				?? (result.interrupted || result.detached
-					? "detached"
-					: result.exitCode === 0
-						? "completed"
-						: "failed");
+				?? (result.stopped
+					? "stopped"
+					: result.interrupted || result.detached
+						? "detached"
+						: result.exitCode === 0
+							? "completed"
+							: "failed");
 			statuses[index] = status;
 		}
 		const running = statuses.filter((status) => status === "running").length;
@@ -788,11 +796,35 @@ function nestedStatusGlyph(state: NestedRunSummary["state"] | NestedStepSummary[
 	if (state === "complete" || state === "completed") return theme.fg("success", "✓");
 	if (state === "failed") return theme.fg("error", "✗");
 	if (state === "paused") return theme.fg("warning", "■");
+	if (state === "stopped") return theme.fg("warning", "■");
 	return theme.fg("muted", "◦");
 }
 
 function nestedRunSeed(run: NestedRunSummary): number | undefined {
 	return runningSeed(run.lastUpdate, run.lastActivityAt, run.currentStep, run.toolCount, run.turnCount, run.totalTokens?.total, run.currentToolStartedAt);
+}
+
+function formatClockTime(ms: number | undefined): string | undefined {
+	if (ms === undefined || !Number.isFinite(ms)) return undefined;
+	const date = new Date(ms);
+	const pad = (value: number) => value.toString().padStart(2, "0");
+	return `${pad(date.getHours())}:${pad(date.getMinutes())}:${pad(date.getSeconds())}`;
+}
+
+function nestedRunEventTime(run: NestedRunSummary): number | undefined {
+	return run.state === "running"
+		? (run.lastActivityAt ?? run.currentToolStartedAt ?? run.lastUpdate ?? run.startedAt)
+		: (run.endedAt ?? run.lastUpdate ?? run.lastActivityAt ?? run.startedAt);
+}
+
+function nestedStepTimestamp(step: NestedStepSummary, fallback?: number): string | undefined {
+	return formatClockTime(step.status === "running"
+		? (step.lastActivityAt ?? step.currentToolStartedAt ?? fallback ?? step.startedAt)
+		: (step.endedAt ?? step.lastActivityAt ?? fallback ?? step.startedAt));
+}
+
+function nestedTimestampPrefix(timestamp: string | undefined): string {
+	return timestamp ? `[${timestamp}] ` : "";
 }
 
 function nestedActivity(input: Pick<NestedRunSummary | NestedStepSummary, "activityState" | "lastActivityAt" | "currentTool" | "currentToolStartedAt" | "currentPath" | "turnCount" | "toolCount">, state: NestedRunSummary["state"] | NestedStepSummary["status"], snapshotNow?: number): string {
@@ -809,6 +841,7 @@ function nestedActivity(input: Pick<NestedRunSummary | NestedStepSummary, "activ
 	if (state === "running") return "thinking…";
 	if (state === "queued" || state === "pending") return "queued…";
 	if (state === "paused") return "Paused";
+	if (state === "stopped") return "Stopped";
 	if (state === "failed") return "Failed";
 	return "Done";
 }
@@ -817,7 +850,8 @@ function formatNestedWidgetLines(children: NestedRunSummary[] | undefined, theme
 	if (!children?.length || lineBudget <= 0) return [];
 	if (!expanded) {
 		const aggregate = formatNestedAggregate(children);
-		return aggregate ? [theme.fg("dim", `↳ ${aggregate}`)] : [];
+		const latest = children.reduce((acc, child) => Math.max(acc, nestedRunEventTime(child) ?? 0), 0);
+		return aggregate ? [theme.fg("dim", `↳ ${nestedTimestampPrefix(formatClockTime(latest))}${aggregate}`)] : [];
 	}
 	const lines: string[] = [];
 	const maxDepth = 2;
@@ -837,7 +871,7 @@ function formatNestedWidgetLines(children: NestedRunSummary[] | undefined, theme
 			}
 			const activity = nestedActivity(child, child.state, snapshotNow ?? child.lastUpdate);
 			const error = child.error ? ` · ${child.error}` : "";
-			lines.push(theme.fg("dim", `${prefix}↳ ${nestedStatusGlyph(child.state, theme, nestedRunSeed(child))} ${nestedRunName(child)} · ${child.state} · ${activity}${error}`));
+			lines.push(theme.fg("dim", `${prefix}↳ ${nestedTimestampPrefix(formatClockTime(nestedRunEventTime(child)))}${nestedStatusGlyph(child.state, theme, nestedRunSeed(child))} ${nestedRunName(child)} · ${child.state} · ${activity}${error}`));
 			if (depth === maxDepth) {
 				const aggregate = formatNestedAggregate([...(child.steps?.flatMap((step) => step.children ?? []) ?? []), ...(child.children ?? [])]);
 				if (aggregate && lines.length < lineBudget) lines.push(theme.fg("dim", `${prefix}  ↳ ${aggregate}`));
@@ -845,7 +879,7 @@ function formatNestedWidgetLines(children: NestedRunSummary[] | undefined, theme
 			}
 			for (const step of child.steps ?? []) {
 				if (lines.length >= lineBudget) return;
-				lines.push(theme.fg("dim", `${prefix}  ↳ ${nestedStatusGlyph(step.status, theme)} ${step.agent} · ${step.status} · ${nestedActivity(step, step.status, snapshotNow ?? child.lastUpdate)}`));
+				lines.push(theme.fg("dim", `${prefix}  ↳ ${nestedTimestampPrefix(nestedStepTimestamp(step, child.lastUpdate))}${nestedStatusGlyph(step.status, theme)} ${step.agent} · ${step.status} · ${nestedActivity(step, step.status, snapshotNow ?? child.lastUpdate)}`));
 				append(step.children, depth + 1, `${prefix}    `);
 			}
 			append(child.children, depth + 1, `${prefix}  `);
@@ -984,13 +1018,14 @@ function widgetSessionMatches(expanded: boolean): boolean {
 		&& widgetLayoutSession.columns === currentTerminalColumns();
 }
 
-function widgetHeaderCounts(jobs: AsyncJobState[]): { running: AsyncJobState[]; queued: AsyncJobState[]; complete: AsyncJobState[]; failed: AsyncJobState[]; paused: AsyncJobState[] } {
+function widgetHeaderCounts(jobs: AsyncJobState[]): { running: AsyncJobState[]; queued: AsyncJobState[]; complete: AsyncJobState[]; failed: AsyncJobState[]; paused: AsyncJobState[]; stopped: AsyncJobState[] } {
 	return {
 		running: jobs.filter((job) => job.status === "running"),
 		queued: jobs.filter((job) => job.status === "queued"),
 		complete: jobs.filter((job) => job.status === "complete"),
 		failed: jobs.filter((job) => job.status === "failed"),
 		paused: jobs.filter((job) => job.status === "paused"),
+		stopped: jobs.filter((job) => job.status === "stopped"),
 	};
 }
 
@@ -1002,6 +1037,7 @@ function buildSingleLineWidgetLines(jobs: AsyncJobState[], theme: Theme, width: 
 	if (counts.running.length > 0) parts.push(`${counts.running.length}/${jobs.length} running`);
 	if (counts.queued.length > 0) parts.push(`${counts.queued.length} queued`);
 	if (counts.failed.length > 0) parts.push(`${counts.failed.length} failed`);
+	if (counts.stopped.length > 0) parts.push(`${counts.stopped.length} stopped`);
 	if (counts.paused.length > 0) parts.push(`${counts.paused.length} paused`);
 	if (!hasActive && counts.complete.length > 0) parts.push(`${counts.complete.length}/${jobs.length} done`);
 	return [truncLine(`${theme.fg(hasActive ? "accent" : "dim", glyph)} ${theme.fg(hasActive ? "accent" : "dim", "subagents")} (${parts.join(", ") || `${jobs.length} total`})`, width)];
@@ -1065,6 +1101,7 @@ function progressiveHeaderLine(jobs: AsyncJobState[], theme: Theme, width: numbe
 	if (counts.queued.length > 0) parts.push(`${counts.queued.length} queued`);
 	if (!hasActive) {
 		if (counts.failed.length > 0) parts.push(`${counts.failed.length} failed`);
+		if (counts.stopped.length > 0) parts.push(`${counts.stopped.length} stopped`);
 		if (counts.paused.length > 0) parts.push(`${counts.paused.length} paused`);
 		if (counts.complete.length > 0) parts.push(`${counts.complete.length}/${jobs.length} done`);
 	}
@@ -1089,7 +1126,7 @@ function progressiveHiddenLine(hiddenJobs: AsyncJobState[], theme: Theme, width:
 	const parts: string[] = [];
 	if (counts.running.length > 0) parts.push(`${counts.running.length} running`);
 	if (counts.queued.length > 0) parts.push(`${counts.queued.length} queued`);
-	const finished = counts.complete.length + counts.failed.length + counts.paused.length;
+	const finished = counts.complete.length + counts.failed.length + counts.paused.length + counts.stopped.length;
 	if (finished > 0) parts.push(`${finished} finished`);
 	return truncLine(theme.fg("dim", `  +${hiddenJobs.length} more${parts.length ? ` (${parts.join(", ")})` : ""}`), width);
 }
@@ -1292,11 +1329,17 @@ function renderSingleCompact(d: Details, r: Details["results"][number], theme: T
 		c.addChild(new Text(truncLine(theme.fg("dim", `  ⎿  ${activity}`), width), 0, 0));
 		const liveStatus = buildLiveStatusLine(r.progress, progressSnapshotNow);
 		if (liveStatus && liveStatus !== activity) c.addChild(new Text(truncLine(theme.fg("dim", `     ${liveStatus}`), width), 0, 0));
+		for (const nestedLine of formatNestedWidgetLines(r.children, theme, width, false, progressSnapshotNow)) {
+			c.addChild(new Text(truncLine(`  ${nestedLine}`, width), 0, 0));
+		}
 		c.addChild(new Text(truncLine(theme.fg("accent", `  ${liveDetailHintText()}`), width), 0, 0));
 		if (r.artifactPaths) c.addChild(new Text(truncLine(theme.fg("dim", `  output: ${shortenPath(r.artifactPaths.outputPath)}`), width), 0, 0));
 		return c;
 	}
 
+	for (const nestedLine of formatNestedWidgetLines(r.children, theme, width, false, r.progress?.lastActivityAt)) {
+		c.addChild(new Text(truncLine(`  ${nestedLine}`, width), 0, 0));
+	}
 	c.addChild(new Text(truncLine(theme.fg("dim", `  ⎿  ${resultStatusLine(r, output)}`), width), 0, 0));
 	const preview = firstOutputLine(output);
 	if (preview && r.exitCode === 0 && !hasEmptyTextOutputWithoutOutputTarget(r.task, output)) {
@@ -1312,7 +1355,9 @@ function renderMultiCompact(d: Details, theme: Theme, frame?: number): Component
 	const hasRunning = d.progress?.some((p) => p.status === "running")
 		|| d.results.some((r) => r.progress?.status === "running")
 		|| workflowGraphHasStatus(d, ["running"]);
-	const failed = d.results.some((r) => r.exitCode !== 0 && r.progress?.status !== "running")
+	const stopped = d.results.some((r) => r.stopped && r.progress?.status !== "running")
+		|| workflowGraphHasStatus(d, ["stopped"]);
+	const failed = d.results.some((r) => !r.stopped && r.exitCode !== 0 && r.progress?.status !== "running")
 		|| workflowGraphHasStatus(d, ["failed"]);
 	const paused = d.results.some((r) => (r.interrupted || r.detached) && r.progress?.status !== "running")
 		|| workflowGraphHasStatus(d, ["paused", "detached"]);
@@ -1335,8 +1380,10 @@ function renderMultiCompact(d: Details, theme: Theme, frame?: number): Component
 	const stats = statJoin(theme, [multiLabel.headerLabel, formatProgressStats(theme, totalSummary), formatTotalCostStat(d.totalCost)]);
 	const glyph = hasRunning
 		? theme.fg("accent", runningGlyph(frame !== undefined ? (runningSeed(progressRunningSeed(totalSummary), d.currentStepIndex) ?? 0) + frame : runningSeed(progressRunningSeed(totalSummary), d.currentStepIndex)))
-		: failed
-			? theme.fg("error", "✗")
+		: stopped
+			? theme.fg("warning", "■")
+			: failed
+				? theme.fg("error", "✗")
 			: paused
 				? theme.fg("warning", "■")
 				: theme.fg("success", "✓");
@@ -1388,9 +1435,17 @@ function renderMultiCompact(d: Details, theme: Theme, frame?: number): Component
 		if (rRunning && rProg && "status" in rProg) {
 			const activity = compactCurrentActivity(rProg);
 			c.addChild(new Text(truncLine(theme.fg("dim", `    ⎿  ${activity}`), width), 0, 0));
+			for (const nestedLine of formatNestedWidgetLines(r.children, theme, width, false, snapshotNowForProgress(rProg))) {
+				c.addChild(new Text(truncLine(`    ${nestedLine}`, width), 0, 0));
+			}
 			c.addChild(new Text(truncLine(theme.fg("accent", `    ${liveDetailHintText()}`), width), 0, 0));
 		} else if (!rPending && (r.exitCode !== 0 || r.interrupted || r.detached || hasEmptyTextOutputWithoutOutputTarget(r.task, output))) {
 			c.addChild(new Text(truncLine(theme.fg(r.exitCode !== 0 ? "error" : "dim", `    ⎿  ${resultStatusLine(r, output)}`), width), 0, 0));
+		}
+		if (!rRunning && !rPending) {
+			for (const nestedLine of formatNestedWidgetLines(r.children, theme, width, false, r.progress?.lastActivityAt)) {
+				c.addChild(new Text(truncLine(`    ${nestedLine}`, width), 0, 0));
+			}
 		}
 		const outputTarget = extractOutputTarget(r.task);
 		if (outputTarget) c.addChild(new Text(truncLine(theme.fg("dim", `    output: ${outputTarget}`), width), 0, 0));
@@ -1416,6 +1471,14 @@ export function renderSubagentResult(
 		const contextPrefix = d?.context === "fork" ? `${theme.fg("warning", "[fork]")} ` : "";
 		const width = getTermWidth() - 4;
 		if (!text.includes("\n")) return new Text(truncLine(`${contextPrefix}${text}`, width), 0, 0);
+		if (d && !options.expanded && !result.isError) {
+			const lines = text.split(/\r?\n/);
+			const firstNonEmptyLine = lines.find((line) => line.trim())?.trim() || "(no output)";
+			const c = new Container();
+			c.addChild(new Text(truncLine(`${contextPrefix}${firstNonEmptyLine} · ${lines.length} lines`, width), 0, 0));
+			c.addChild(new Text(truncLine(theme.fg("accent", `  Press ${liveDetailKeyText()} for full output`), width), 0, 0));
+			return c;
+		}
 		const c = new Container();
 		const wrapped = wrapPlainText(`${contextPrefix}${text}`, width);
 		for (const line of wrapped) c.addChild(new Text(line, 0, 0));
@@ -1462,6 +1525,9 @@ export function renderSubagentResult(
 
 		if (isRunning && r.progress) {
 			const progressSnapshotNow = snapshotNowForProgress(r.progress);
+			for (const nestedLine of formatNestedWidgetLines(r.children, theme, w, true, progressSnapshotNow, 12)) {
+				c.addChild(new Text(fit(`  ${nestedLine}`), 0, 0));
+			}
 			const toolLine = formatCurrentToolLine(r.progress, w, expanded, progressSnapshotNow);
 			if (toolLine) {
 				c.addChild(new Text(fit(theme.fg("warning", `> ${toolLine}`)), 0, 0));
@@ -1488,6 +1554,10 @@ export function renderSubagentResult(
 			}
 			if (toolLine || liveStatusLine || r.progress.recentTools?.length || r.progress.recentOutput?.length || r.artifactPaths) {
 				c.addChild(new Spacer(1));
+			}
+		} else {
+			for (const nestedLine of formatNestedWidgetLines(r.children, theme, w, true, r.progress?.lastActivityAt, 8)) {
+				c.addChild(new Text(fit(`  ${nestedLine}`), 0, 0));
 			}
 		}
 
@@ -1533,6 +1603,7 @@ export function renderSubagentResult(
 		&& hasEmptyTextOutputWithoutOutputTarget(r.task, getSingleResultOutput(r)),
 	);
 	const hasWorkflowFailure = workflowGraphHasStatus(d, ["failed"]);
+	const hasWorkflowStop = d.results.some((r) => r.stopped && r.progress?.status !== "running") || workflowGraphHasStatus(d, ["stopped"]);
 	const hasWorkflowPause = workflowGraphHasStatus(d, ["paused", "detached"]);
 	const icon = hasRunning
 		? theme.fg("warning", "running")
@@ -1540,8 +1611,10 @@ export function renderSubagentResult(
 			? theme.fg("warning", "warning")
 			: hasWorkflowFailure
 				? theme.fg("error", "failed")
-				: hasWorkflowPause
-					? theme.fg("warning", "paused")
+				: hasWorkflowStop
+					? theme.fg("warning", "stopped")
+					: hasWorkflowPause
+						? theme.fg("warning", "paused")
 					: ok === d.results.length
 						? theme.fg("success", "ok")
 						: theme.fg("error", "failed");
@@ -1707,6 +1780,9 @@ export function renderSubagentResult(
 			if (liveStatusLine) {
 				c.addChild(new Text(fit(theme.fg("accent", `    ${liveStatusLine}`)), 0, 0));
 			}
+			for (const nestedLine of formatNestedWidgetLines(r.children, theme, w, true, progressSnapshotNow, 8)) {
+				c.addChild(new Text(fit(`    ${nestedLine}`), 0, 0));
+			}
 			c.addChild(new Text(fit(theme.fg("accent", `    ${liveDetailHintText()}`)), 0, 0));
 			if (r.artifactPaths) {
 				c.addChild(new Text(fit(theme.fg("dim", `    artifacts: ${shortenPath(r.artifactPaths.outputPath)}`)), 0, 0));
@@ -1723,6 +1799,12 @@ export function renderSubagentResult(
 			const recentLines = (rProg.recentOutput ?? []).slice(-5);
 			for (const line of recentLines) {
 				c.addChild(new Text(fit(theme.fg("dim", `      ${line}`)), 0, 0));
+			}
+		}
+
+		if (!rRunning) {
+			for (const nestedLine of formatNestedWidgetLines(r.children, theme, w, true, r.progress?.lastActivityAt, 8)) {
+				c.addChild(new Text(fit(`    ${nestedLine}`), 0, 0));
 			}
 		}
 

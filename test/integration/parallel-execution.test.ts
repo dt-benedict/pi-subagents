@@ -191,6 +191,42 @@ describe("parallel agent execution", { skip: !piAvailable ? "pi packages not ava
 		}
 	});
 
+	it("does not apply agent acceptance defaults to top-level parallel tasks", { skip: !createSubagentExecutor ? "executor not importable" : undefined }, async () => {
+		mockPi.onCall({ output: "parallel response without explicit acceptance" });
+		const executor = makeExecutor([
+			makeAgent("echo", { defaultAcceptance: { level: "none", reason: "single launches only" } }),
+		]);
+
+		const result = await executor.execute(
+			"parallel-agent-acceptance-default",
+			{ tasks: [{ agent: "echo", task: "Return a concise answer" }] },
+			new AbortController().signal,
+			undefined,
+			makeMinimalCtx(tempDir),
+		);
+
+		assert.equal(result.isError, undefined);
+		assert.equal(result.details?.results?.[0]?.acceptance?.explicit, false);
+		assert.equal(result.details?.results?.[0]?.acceptance?.effectiveAcceptance.level, "attested");
+	});
+
+	it("applies agent acceptance roles to inferred parallel acceptance", { skip: !createSubagentExecutor ? "executor not importable" : undefined }, async () => {
+		mockPi.onCall({ output: "exploration complete" });
+		const executor = makeExecutor([
+			makeAgent("worker", { acceptanceRole: "read-only" }),
+		]);
+
+		const result = await executor.execute(
+			"parallel-agent-acceptance-role",
+			{ tasks: [{ agent: "worker", task: "Explore the authentication flow" }] },
+			new AbortController().signal,
+			undefined,
+			makeMinimalCtx(tempDir),
+		);
+
+		assert.equal(result.details?.results?.[0]?.acceptance?.effectiveAcceptance.level, "attested");
+	});
+
 	it("top-level parallel output saves use per-task output paths", { skip: !createSubagentExecutor ? "executor not importable" : undefined }, async () => {
 		mockPi.onCall({ output: "Saved report" });
 		const executor = makeExecutor();
@@ -305,6 +341,28 @@ describe("parallel agent execution", { skip: !piAvailable ? "pi packages not ava
 		assert.match(result.content[0]?.text ?? "", /same path/);
 		assert.equal(mockPi.callCount(), 0);
 	});
+
+	for (const outputOverride of [undefined, true] as const) {
+		it(`rejects foreground inherited output collisions (${outputOverride === true ? "output:true" : "omitted output"})`, { skip: !createSubagentExecutor ? "executor not importable" : undefined }, async () => {
+			const executor = makeExecutor([makeAgent("echo", { output: "context.md" })]);
+			const tasks = [
+				{ agent: "echo", task: "Write A", ...(outputOverride !== undefined ? { output: outputOverride } : {}) },
+				{ agent: "echo", task: "Write B", ...(outputOverride !== undefined ? { output: outputOverride } : {}) },
+			];
+
+			const result = await executor.execute(
+				`parallel-inherited-output-${outputOverride === true ? "true" : "omitted"}`,
+				{ tasks },
+				new AbortController().signal,
+				undefined,
+				makeMinimalCtx(tempDir),
+			);
+
+			assert.equal(result.isError, true);
+			assert.match(result.content[0]?.text ?? "", /resolve output to the same path/);
+			assert.equal(mockPi.callCount(), 0);
+		});
+	}
 
 	it("treats string false as disabled output in top-level parallel runs", { skip: !createSubagentExecutor ? "executor not importable" : undefined }, async () => {
 		mockPi.onCall({ output: "Review done" });

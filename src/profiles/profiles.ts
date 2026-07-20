@@ -3,7 +3,7 @@ import * as os from "node:os";
 import * as path from "node:path";
 import type { ExtensionAPI, ExtensionContext } from "@earendil-works/pi-coding-agent";
 import { BUILTIN_AGENT_NAMES } from "../agents/agents.ts";
-import { findModelInfo, getLiveAvailableModels, getSupportedThinkingLevels, splitKnownThinkingSuffix, toModelInfo } from "../shared/model-info.ts";
+import { findModelInfo, getSupportedThinkingLevels, splitKnownThinkingSuffix, toModelInfo } from "../shared/model-info.ts";
 import { getAgentDir } from "../shared/utils.ts";
 
 export const DEFAULT_PROVIDER_MODELS_MAX_AGE_DAYS = 7;
@@ -528,7 +528,7 @@ export async function refreshProviderModelCatalog(
 		}
 	}
 
-	const availableModels = getLiveAvailableModels(ctx.modelRegistry).filter((model) => model.provider === normalizedProvider);
+	const availableModels = ctx.modelRegistry.getAvailable().filter((model) => model.provider === normalizedProvider);
 	if (availableModels.length === 0) {
 		throw new Error(`No models found in the current registry for provider '${normalizedProvider}'.`);
 	}
@@ -637,7 +637,7 @@ export async function checkSubagentProfile(
 	name: string,
 ): Promise<ProfileCheckResult> {
 	const { filePath, profile } = readSubagentProfile(name);
-	const availableModels = getLiveAvailableModels(ctx.modelRegistry).map(toModelInfo);
+	const availableModels = ctx.modelRegistry.getAvailable().map(toModelInfo);
 	const entries = Object.entries(profile.subagents.agentOverrides)
 		.filter(([, value]) => typeof value?.model === "string" && value.model.trim())
 		.map(([agent, value]) => ({ agent, model: value.model!.trim() }));

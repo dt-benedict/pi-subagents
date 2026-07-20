@@ -17,6 +17,7 @@ import {
 	resolveSubagentResultStatus,
 } from "../../intercom/result-intercom.ts";
 import { projectNestedRegistryForRoot, sanitizeSummary } from "../shared/nested-events.ts";
+import { resolveWatchPath } from "../../shared/utils.ts";
 
 const WATCHER_RESTART_DELAY_MS = 3000;
 const POLL_INTERVAL_MS = 3000;
@@ -40,6 +41,8 @@ type ResultFileChild = {
 	output?: string;
 	error?: string;
 	success?: boolean;
+	state?: string;
+	stopped?: boolean;
 	sessionFile?: string;
 	artifactPaths?: { outputPath?: string };
 	intercomTarget?: string;
@@ -91,13 +94,6 @@ function shouldFallBackToPolling(error: unknown): boolean {
 	return code === "EMFILE" || code === "ENOSPC";
 }
 
-function resolveNativeWatchDir(fsApi: ResultWatcherFs, resultsDir: string): string {
-	try {
-		return fsApi.realpathSync.native(resultsDir);
-	} catch {
-		return resultsDir;
-	}
-}
 
 export function createResultWatcher(
 	pi: { events: IntercomEventBus },
@@ -155,11 +151,18 @@ export function createResultWatcher(
 					: output;
 				const sessionPath = result.sessionFile ?? (resultChildren.length === 1 ? data.sessionFile : undefined);
 				const childNestedChildren = sanitizeNestedResultChildren(result.children, resultPath, `results[${index}].children`);
+				const childState = result.state === "paused" || result.state === "stopped"
+					? result.state
+					: result.stopped === true
+						? "stopped"
+						: data.state === "paused" || (!hasResultChildren && (data.state === "stopped" || typeof result.success !== "boolean"))
+							? data.state
+							: undefined;
 				return {
 					agent: result.agent ?? data.agent ?? `step-${index + 1}`,
 					status: resolveSubagentResultStatus({
 						success: result.success,
-						state: data.state === "paused" || typeof result.success !== "boolean" ? data.state : undefined,
+						state: childState,
 					}),
 					summary,
 					index,
@@ -271,7 +274,7 @@ export function createResultWatcher(
 			state.watcherRestartTimer = null;
 		}
 		try {
-			const watchDir = resolveNativeWatchDir(fsApi, resultsDir);
+			const watchDir = resolveWatchPath(resultsDir, fsApi.realpathSync.native);
 			state.watcher = fsApi.watch(watchDir, (ev, file) => {
 				if (ev !== "rename" || !file) return;
 				const fileName = file.toString();

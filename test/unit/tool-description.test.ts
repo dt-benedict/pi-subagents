@@ -46,6 +46,10 @@ describe("registered subagent tool description", () => {
 		assert.doesNotMatch(description, /omit for async\/background runs/i);
 		assert.match(description, /SAFETY-CRITICAL SUBAGENT GUIDANCE/);
 		assert.match(description, /Do not sleep or poll status just to wait/i);
+		assert.match(description, /use subagent_wait/i);
+		assert.match(description, /interactive session.*normally return control/i);
+		assert.match(description, /Headless sessions auto-drain current-session work at agent_end/i);
+		assert.doesNotMatch(description, /MUST call subagent_wait/i);
 		assert.match(description, /ordinary child subagents are not orchestrators/i);
 		assert.match(description, /keep one writer/i);
 		assert.match(description, /view: "fleet"/);
@@ -54,8 +58,27 @@ describe("registered subagent tool description", () => {
 		assert.match(description, /schedule-list/);
 		assert.match(description, /action: "eject"/);
 		assert.match(description, /action: "disable"/);
+		assert.match(description, /action: "grant-spawn-budget"/);
+		assert.match(description, /root interactive parent/i);
+		assert.match(description, /cumulative grants cannot exceed the original configured cap/i);
+		assert.match(description, /acceptanceRole affects inferred acceptance only/i);
+		assert.match(description, /Explicit task mutation\/no-edit intent wins/i);
+		assert.match(description, /omission preserves name heuristics/i);
+		assert.match(description, /false or an empty string to clear it/i);
 		assert.match(description, /status\.json/);
 		assert.match(description, /events\.jsonl/);
+		// Chain quick-reference: both sequential and parallel fan-out examples (#417)
+		assert.match(description, /CHAIN EXAMPLES/i);
+		assert.match(
+			description,
+			/chain:\s*\[\s*\{\s*agent:\s*"[\w-]+",\s*task:\s*"[^"]*"\s*\}\s*,\s*\{\s*agent:\s*"[\w-]+",\s*task:\s*"[^"]*\{previous\}[^"]*"\s*\}\s*\]/,
+			"full mode should show a sequential chain example using {previous}",
+		);
+		assert.match(
+			description,
+			/\{\s*parallel:\s*\[\s*\{\s*agent:\s*"[\w-]+",\s*task:\s*"[^"]*",\s*count:\s*\d+\s*\}\s*\]\s*\}/,
+			"full mode should show a parallel fan-out chain example with count",
+		);
 	});
 
 	it("offers a compact mode that keeps safety-critical guidance", () => {
@@ -67,7 +90,10 @@ describe("registered subagent tool description", () => {
 		assert.match(description, /PARALLEL/);
 		assert.match(description, /CHAIN/);
 		assert.match(description, /action without execution fields/i);
-		assert.match(description, /wait tool/i);
+		assert.match(description, /subagent_wait/i);
+		assert.match(description, /interactive session.*normally return control/i);
+		assert.match(description, /Non-interactive runs.*auto-drain current-session work at agent_end/i);
+		assert.doesNotMatch(description, /MUST call subagent_wait/i);
 		assert.match(description, /Do not sleep or poll/i);
 		assert.match(description, /ordinary child subagents are not orchestrators/i);
 		assert.match(description, /one writer/i);
@@ -77,8 +103,18 @@ describe("registered subagent tool description", () => {
 		assert.match(description, /schedule-list/);
 		assert.match(description, /eject/);
 		assert.match(description, /disable/);
+		assert.match(description, /grant-spawn-budget/);
+		assert.match(description, /acceptanceRole.*affects inferred acceptance only/i);
+		assert.match(description, /Explicit task intent wins/i);
+		assert.match(description, /omission keeps name heuristics/i);
+		assert.match(description, /false or an empty string to clear it/i);
 		assert.match(description, /status\.json/);
 		assert.match(description, /events\.jsonl/);
+		// Compact mode keeps a chain quick-reference too (#417)
+		assert.match(description, /chain example/i);
+		assert.match(description, /\{previous\}/);
+		assert.match(description, /parallel:/);
+		assert.match(description, /count:/);
 	});
 
 	it("renders a custom project description with placeholders and mandatory safety guidance", () => {

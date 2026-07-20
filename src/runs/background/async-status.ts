@@ -2,7 +2,7 @@ import * as fs from "node:fs";
 import * as path from "node:path";
 import { formatDuration, formatModelThinking, formatTokens, shortenPath } from "../../shared/formatters.ts";
 import { formatActivityLabel, formatParallelOutcome } from "../../shared/status-format.ts";
-import { type ActivityState, type AsyncJobStep, type AsyncParallelGroupStatus, type AsyncStatus, type CostSummary, type NestedRunSummary, type SubagentRunMode, type TokenUsage, type TurnBudgetState } from "../../shared/types.ts";
+import { type ActivityState, type AsyncJobStep, type AsyncParallelGroupStatus, type AsyncStatus, type CostSummary, type NestedRunSummary, type SteeringStatus, type SubagentRunMode, type TokenUsage, type TurnBudgetState } from "../../shared/types.ts";
 import { readStatus } from "../../shared/utils.ts";
 import { attachRootChildrenToSteps, buildNestedRouteIndex, type NestedRoute, projectNestedEvents } from "../shared/nested-events.ts";
 import { formatNestedRunStatusLines } from "../shared/nested-render.ts";
@@ -27,8 +27,7 @@ interface AsyncRunStepSummary {
 	recentOutput?: string[];
 	turnCount?: number;
 	toolCount?: number;
-	steerCount?: number;
-	lastSteerAt?: number;
+	steering?: SteeringStatus;
 	durationMs?: number;
 	tokens?: TokenUsage;
 	totalCost?: CostSummary;
@@ -38,6 +37,7 @@ interface AsyncRunStepSummary {
 	attemptedModels?: string[];
 	error?: string;
 	timedOut?: boolean;
+	stopped?: boolean;
 	turnBudget?: TurnBudgetState;
 	turnBudgetExceeded?: boolean;
 	wrapUpRequested?: boolean;
@@ -48,7 +48,7 @@ export interface AsyncRunSummary {
 	id: string;
 	asyncDir: string;
 	sessionId?: string;
-	state: "queued" | "running" | "complete" | "failed" | "paused";
+	state: "queued" | "running" | "complete" | "failed" | "paused" | "stopped";
 	error?: string;
 	activityState?: ActivityState;
 	lastActivityAt?: number;
@@ -57,8 +57,7 @@ export interface AsyncRunSummary {
 	currentPath?: string;
 	turnCount?: number;
 	toolCount?: number;
-	steerCount?: number;
-	lastSteerAt?: number;
+	steering?: SteeringStatus;
 	mode: SubagentRunMode;
 	cwd?: string;
 	startedAt: number;
@@ -67,6 +66,7 @@ export interface AsyncRunSummary {
 	timeoutMs?: number;
 	deadlineAt?: number;
 	timedOut?: boolean;
+	stopped?: boolean;
 	turnBudget?: TurnBudgetState;
 	turnBudgetExceeded?: boolean;
 	wrapUpRequested?: boolean;
@@ -178,8 +178,7 @@ function statusToSummary(asyncDir: string, status: AsyncStatus & { cwd?: string 
 			...(step.recentOutput ? { recentOutput: [...step.recentOutput] } : {}),
 			...(step.turnCount !== undefined ? { turnCount: step.turnCount } : {}),
 			...(step.toolCount !== undefined ? { toolCount: step.toolCount } : {}),
-			...(step.steerCount !== undefined ? { steerCount: step.steerCount } : {}),
-			...(step.lastSteerAt !== undefined ? { lastSteerAt: step.lastSteerAt } : {}),
+			...(step.steering ? { steering: step.steering } : {}),
 			...(step.durationMs !== undefined ? { durationMs: step.durationMs } : {}),
 			...(step.tokens ? { tokens: step.tokens } : {}),
 			...(step.totalCost ? { totalCost: step.totalCost } : {}),
@@ -189,6 +188,7 @@ function statusToSummary(asyncDir: string, status: AsyncStatus & { cwd?: string 
 			...(step.attemptedModels ? { attemptedModels: step.attemptedModels } : {}),
 			...(step.error ? { error: step.error } : {}),
 			...(step.timedOut !== undefined ? { timedOut: step.timedOut } : {}),
+			...(step.stopped !== undefined ? { stopped: step.stopped } : {}),
 			...(step.turnBudget ? { turnBudget: step.turnBudget } : {}),
 			...(step.turnBudgetExceeded !== undefined ? { turnBudgetExceeded: step.turnBudgetExceeded } : {}),
 			...(step.wrapUpRequested !== undefined ? { wrapUpRequested: step.wrapUpRequested } : {}),
@@ -209,8 +209,7 @@ function statusToSummary(asyncDir: string, status: AsyncStatus & { cwd?: string 
 		currentPath: status.currentPath,
 		turnCount: status.turnCount,
 		toolCount: status.toolCount,
-		steerCount: status.steerCount,
-		lastSteerAt: status.lastSteerAt,
+		steering: status.steering,
 		mode: status.mode,
 		cwd: status.cwd,
 		startedAt: status.startedAt,
@@ -219,6 +218,7 @@ function statusToSummary(asyncDir: string, status: AsyncStatus & { cwd?: string 
 		...(status.timeoutMs !== undefined ? { timeoutMs: status.timeoutMs } : {}),
 		...(status.deadlineAt !== undefined ? { deadlineAt: status.deadlineAt } : {}),
 		...(status.timedOut !== undefined ? { timedOut: status.timedOut } : {}),
+		...(status.stopped !== undefined ? { stopped: status.stopped } : {}),
 		...(status.turnBudget ? { turnBudget: status.turnBudget } : {}),
 		...(status.turnBudgetExceeded !== undefined ? { turnBudgetExceeded: status.turnBudgetExceeded } : {}),
 		...(status.wrapUpRequested !== undefined ? { wrapUpRequested: status.wrapUpRequested } : {}),
@@ -237,12 +237,17 @@ function statusToSummary(asyncDir: string, status: AsyncStatus & { cwd?: string 
 	};
 }
 
+export function summarizeAsyncStatus(asyncDir: string, status: AsyncStatus & { cwd?: string }): AsyncRunSummary {
+	return statusToSummary(asyncDir, status);
+}
+
 function sortRuns(runs: AsyncRunSummary[]): AsyncRunSummary[] {
 	const rank = (state: AsyncRunSummary["state"]): number => {
 		switch (state) {
 			case "running": return 0;
 			case "queued": return 1;
 			case "failed": return 2;
+			case "stopped": return 2;
 			case "paused": return 2;
 			case "complete": return 3;
 		}
@@ -294,11 +299,13 @@ export function listAsyncRuns(asyncDirRoot: string, options: AsyncRunListOptions
 		if (options.sessionId && status.sessionId !== options.sessionId) continue;
 		const nestedWarnings: string[] = [];
 		let nestedRoute: NestedRoute | undefined;
-		try {
-			nestedRoute = resolveNestedRoute(status.runId || path.basename(asyncDir));
-			if (nestedRoute) reconcileNestedAsyncDescendants(nestedRoute, { resultsDir: options.resultsDir, kill: options.kill, now: options.now });
-		} catch (error) {
-			nestedWarnings.push(`Nested status unavailable: ${getErrorMessage(error)}`);
+		if (options.reconcile !== false) {
+			try {
+				nestedRoute = resolveNestedRoute(status.runId || path.basename(asyncDir));
+				if (nestedRoute) reconcileNestedAsyncDescendants(nestedRoute, { resultsDir: options.resultsDir, kill: options.kill, now: options.now });
+			} catch (error) {
+				nestedWarnings.push(`Nested status unavailable: ${getErrorMessage(error)}`);
+			}
 		}
 		const summary = statusToSummary(asyncDir, status, nestedWarnings, nestedRoute);
 		runs.push(summary);
@@ -308,18 +315,18 @@ export function listAsyncRuns(asyncDirRoot: string, options: AsyncRunListOptions
 	return options.limit !== undefined ? sorted.slice(0, options.limit) : sorted;
 }
 
-function formatActivityFacts(input: { activityState?: ActivityState; lastActivityAt?: number; currentTool?: string; currentToolStartedAt?: number; currentPath?: string; turnCount?: number; toolCount?: number; steerCount?: number; lastSteerAt?: number; turnBudget?: TurnBudgetState; turnBudgetExceeded?: boolean; wrapUpRequested?: boolean }): string | undefined {
+function formatActivityFacts(input: { activityState?: ActivityState; lastActivityAt?: number; currentTool?: string; currentToolStartedAt?: number; currentPath?: string; turnCount?: number; toolCount?: number; steering?: SteeringStatus; turnBudget?: TurnBudgetState; turnBudgetExceeded?: boolean; wrapUpRequested?: boolean }): string | undefined {
 	const facts: string[] = [];
 	if (input.currentTool && input.currentToolStartedAt !== undefined) facts.push(`tool ${input.currentTool} ${formatDuration(Math.max(0, Date.now() - input.currentToolStartedAt))}`);
 	else if (input.currentTool) facts.push(`tool ${input.currentTool}`);
 	if (input.currentPath) facts.push(shortenPath(input.currentPath));
 	if (input.turnCount !== undefined) facts.push(`${input.turnCount} turns`);
 	if (input.turnBudgetExceeded && input.turnBudget) facts.push(`turn budget exceeded ${input.turnBudget.turnCount}/${input.turnBudget.maxTurns}+${input.turnBudget.graceTurns}`);
+	else if (input.turnBudget?.outcome === "termination-deferred") facts.push(`turn-budget termination deferred ${input.turnBudget.turnCount}/${input.turnBudget.maxTurns}+${input.turnBudget.graceTurns}`);
 	else if (input.wrapUpRequested && input.turnBudget) facts.push(`wrap-up requested ${input.turnBudget.turnCount}/${input.turnBudget.maxTurns}`);
 	else if (input.turnBudget) facts.push(`turn budget ${input.turnBudget.turnCount}/${input.turnBudget.maxTurns}+${input.turnBudget.graceTurns}`);
 	if (input.toolCount !== undefined) facts.push(`${input.toolCount} tools`);
-	if (input.steerCount !== undefined) facts.push(`${input.steerCount} steers`);
-	if (typeof input.lastSteerAt === "number" && Number.isFinite(input.lastSteerAt)) facts.push(`last steer ${new Date(input.lastSteerAt).toISOString()}`);
+	if (input.steering) facts.push(`steering ${input.steering.scheduled} scheduled, ${input.steering.pending} pending, ${input.steering.delivered} delivered, ${input.steering.failed} failed, ${input.steering.recovered} recovered`);
 	const activity = formatActivityLabel(input.lastActivityAt, input.activityState);
 	return activity || facts.length ? [activity, ...facts].filter(Boolean).join(" | ") : undefined;
 }

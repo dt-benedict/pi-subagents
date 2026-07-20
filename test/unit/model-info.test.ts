@@ -1,6 +1,6 @@
 import assert from "node:assert/strict";
 import { describe, it } from "node:test";
-import { findModelInfo, getLiveAvailableModels, getSupportedThinkingLevels, type ModelInfo } from "../../src/shared/model-info.ts";
+import { findModelInfo, getSupportedThinkingLevels, splitKnownThinkingSuffix, toModelInfo, type ModelInfo } from "../../src/shared/model-info.ts";
 
 describe("model info helpers", () => {
 	const ambiguousModels: ModelInfo[] = [
@@ -20,14 +20,19 @@ describe("model info helpers", () => {
 		assert.equal(findModelInfo("openai/gpt-5-mini:high", ambiguousModels, "github-copilot")?.fullId, "openai/gpt-5-mini");
 	});
 
-	it("keeps the legacy full thinking list for reasoning models without per-level metadata", () => {
+	it("preserves registry API metadata", () => {
+		assert.equal(toModelInfo({ provider: "gateway", id: "model", api: "anthropic-messages" }).api, "anthropic-messages");
+	});
+
+	it("keeps the legacy thinking list for models without per-level metadata", () => {
 		assert.deepEqual(
 			getSupportedThinkingLevels({ provider: "openai", id: "gpt-5", fullId: "openai/gpt-5", reasoning: true }),
 			["off", "minimal", "low", "medium", "high", "xhigh"],
 		);
+		assert.deepEqual(getSupportedThinkingLevels(undefined), ["off", "minimal", "low", "medium", "high", "xhigh"]);
 	});
 
-	it("keeps the legacy full thinking list when older model metadata omits reasoning", () => {
+	it("keeps the legacy thinking list when older model metadata omits reasoning", () => {
 		assert.deepEqual(
 			getSupportedThinkingLevels({ provider: "openai", id: "gpt-5", fullId: "openai/gpt-5" }),
 			["off", "minimal", "low", "medium", "high", "xhigh"],
@@ -60,30 +65,20 @@ describe("model info helpers", () => {
 		);
 	});
 
-	it("offers max only when the model explicitly declares it", () => {
+	it("honors an explicit max mapping and recognizes max suffixes", () => {
 		assert.deepEqual(
 			getSupportedThinkingLevels({
-				provider: "bluebox-azure-openai",
-				id: "gpt-5_6-sol",
-				fullId: "bluebox-azure-openai/gpt-5_6-sol",
+				provider: "openai",
+				id: "gpt-5",
+				fullId: "openai/gpt-5",
 				reasoning: true,
-				thinkingLevelMap: { minimal: null, xhigh: "xhigh", max: "max" },
+				thinkingLevelMap: { off: null, minimal: null, low: null, medium: null, high: null, xhigh: null, max: "max" },
 			}),
-			["off", "low", "medium", "high", "xhigh", "max"],
+			["max"],
 		);
-	});
-
-	it("refreshes the model registry before reading and tolerates refresh failures", () => {
-		let available = ["old"];
-		let refreshes = 0;
-		const registry = {
-			refresh: () => { refreshes++; available = ["new"]; },
-			getAvailable: () => available,
-		};
-		assert.deepEqual(getLiveAvailableModels(registry), ["new"]);
-		assert.equal(refreshes, 1);
-
-		registry.refresh = () => { throw new Error("partial models.json write"); };
-		assert.deepEqual(getLiveAvailableModels(registry), ["new"]);
+		assert.deepEqual(
+			splitKnownThinkingSuffix("openai/gpt-5:max"),
+			{ baseModel: "openai/gpt-5", thinkingSuffix: ":max" },
+		);
 	});
 });

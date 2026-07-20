@@ -3,7 +3,7 @@ import * as fs from "node:fs";
 import * as os from "node:os";
 import * as path from "node:path";
 import { afterEach, describe, it } from "node:test";
-import { writeSteerRequestToDir } from "../../src/runs/background/control-channel.ts";
+import { consumeSteerAcks, writeSteerRequestToDir } from "../../src/runs/background/control-channel.ts";
 import {
 	SUBAGENT_CHILD_AGENT_ENV,
 	SUBAGENT_CHILD_INDEX_ENV,
@@ -11,15 +11,21 @@ import {
 	SUBAGENT_ORCHESTRATOR_SESSION_ID_ENV,
 	SUBAGENT_ORCHESTRATOR_TARGET_ENV,
 	SUBAGENT_RUN_ID_ENV,
+	SUBAGENT_STEER_ACK_DIR_ENV,
+	SUBAGENT_STEER_CAPABILITY_ENV,
 	SUBAGENT_STEER_INBOX_ENV,
 	SUBAGENT_SUPERVISOR_CHANNEL_DIR_ENV,
 } from "../../src/runs/shared/pi-args.ts";
 import { STRUCTURED_OUTPUT_CAPTURE_ENV, STRUCTURED_OUTPUT_SCHEMA_ENV } from "../../src/runs/shared/structured-output.ts";
 import { TOOL_BUDGET_ENV } from "../../src/runs/shared/tool-budget.ts";
+import { CHILD_TOOL_DIAGNOSTIC_PATH_ENV, readChildToolDiagnostic, REQUIRED_CHILD_TOOLS_ENV } from "../../src/runs/shared/tool-availability.ts";
+import { CHILD_WATCHDOG_CONFIG_ENV } from "../../src/watchdog/child-status.ts";
+import { SUBAGENT_WATCHDOG_WARNING_TYPE } from "../../src/watchdog/types.ts";
 import registerSubagentPromptRuntime, {
 	CHILD_FANOUT_BOUNDARY_INSTRUCTIONS,
 	CHILD_SUBAGENT_BOUNDARY_INSTRUCTIONS,
 	SUBAGENT_INTERCOM_SESSION_NAME_ENV,
+	registerSteeringInbox,
 	rewriteSubagentPrompt,
 	stripInheritedSkills,
 	stripParentOnlySubagentMessages,
@@ -33,15 +39,20 @@ const envSnapshot = {
 	PI_SUBAGENT_INTERCOM_SESSION_NAME: process.env.PI_SUBAGENT_INTERCOM_SESSION_NAME,
 	PI_SUBAGENT_FANOUT_CHILD: process.env.PI_SUBAGENT_FANOUT_CHILD,
 	PI_SUBAGENT_STEER_INBOX: process.env.PI_SUBAGENT_STEER_INBOX,
+	PI_SUBAGENT_STEER_CAPABILITY: process.env.PI_SUBAGENT_STEER_CAPABILITY,
+	PI_SUBAGENT_STEER_ACK_DIR: process.env.PI_SUBAGENT_STEER_ACK_DIR,
 	PI_SUBAGENT_STRUCTURED_OUTPUT_CAPTURE: process.env.PI_SUBAGENT_STRUCTURED_OUTPUT_CAPTURE,
 	PI_SUBAGENT_STRUCTURED_OUTPUT_SCHEMA: process.env.PI_SUBAGENT_STRUCTURED_OUTPUT_SCHEMA,
 	PI_SUBAGENT_TOOL_BUDGET: process.env.PI_SUBAGENT_TOOL_BUDGET,
+	PI_SUBAGENT_REQUIRED_TOOLS: process.env.PI_SUBAGENT_REQUIRED_TOOLS,
+	PI_SUBAGENT_TOOL_DIAGNOSTIC_PATH: process.env.PI_SUBAGENT_TOOL_DIAGNOSTIC_PATH,
 	PI_SUBAGENT_ORCHESTRATOR_TARGET: process.env.PI_SUBAGENT_ORCHESTRATOR_TARGET,
 	PI_SUBAGENT_ORCHESTRATOR_SESSION_ID: process.env.PI_SUBAGENT_ORCHESTRATOR_SESSION_ID,
 	PI_SUBAGENT_SUPERVISOR_CHANNEL_DIR: process.env.PI_SUBAGENT_SUPERVISOR_CHANNEL_DIR,
 	PI_SUBAGENT_RUN_ID: process.env.PI_SUBAGENT_RUN_ID,
 	PI_SUBAGENT_CHILD_AGENT: process.env.PI_SUBAGENT_CHILD_AGENT,
 	PI_SUBAGENT_CHILD_INDEX: process.env.PI_SUBAGENT_CHILD_INDEX,
+	PI_SUBAGENT_WATCHDOG_CHILD_CONFIG: process.env.PI_SUBAGENT_WATCHDOG_CHILD_CONFIG,
 };
 
 const SKILLS_SECTION = "\n\nThe following skills provide specialized instructions for specific tasks.\nUse the read tool to load a skill's file when the task matches its description.\nWhen a skill file references a relative path, resolve it against the skill directory (parent of SKILL.md / dirname of the path) and use that absolute path in tool commands.\n\n<available_skills>\n  <skill>\n    <name>safe-bash</name>\n    <description>desc</description>\n    <location>/tmp/SKILL.md</location>\n  </skill>\n  <skill>\n    <name>pi-subagents</name>\n    <description>delegate to subagents</description>\n    <location>/tmp/pi-subagents/SKILL.md</location>\n  </skill>\n</available_skills>";
@@ -74,12 +85,20 @@ afterEach(() => {
 	else process.env.PI_SUBAGENT_FANOUT_CHILD = envSnapshot.PI_SUBAGENT_FANOUT_CHILD;
 	if (envSnapshot.PI_SUBAGENT_STEER_INBOX === undefined) delete process.env[SUBAGENT_STEER_INBOX_ENV];
 	else process.env[SUBAGENT_STEER_INBOX_ENV] = envSnapshot.PI_SUBAGENT_STEER_INBOX;
+	if (envSnapshot.PI_SUBAGENT_STEER_CAPABILITY === undefined) delete process.env[SUBAGENT_STEER_CAPABILITY_ENV];
+	else process.env[SUBAGENT_STEER_CAPABILITY_ENV] = envSnapshot.PI_SUBAGENT_STEER_CAPABILITY;
+	if (envSnapshot.PI_SUBAGENT_STEER_ACK_DIR === undefined) delete process.env[SUBAGENT_STEER_ACK_DIR_ENV];
+	else process.env[SUBAGENT_STEER_ACK_DIR_ENV] = envSnapshot.PI_SUBAGENT_STEER_ACK_DIR;
 	if (envSnapshot.PI_SUBAGENT_STRUCTURED_OUTPUT_CAPTURE === undefined) delete process.env[STRUCTURED_OUTPUT_CAPTURE_ENV];
 	else process.env[STRUCTURED_OUTPUT_CAPTURE_ENV] = envSnapshot.PI_SUBAGENT_STRUCTURED_OUTPUT_CAPTURE;
 	if (envSnapshot.PI_SUBAGENT_STRUCTURED_OUTPUT_SCHEMA === undefined) delete process.env[STRUCTURED_OUTPUT_SCHEMA_ENV];
 	else process.env[STRUCTURED_OUTPUT_SCHEMA_ENV] = envSnapshot.PI_SUBAGENT_STRUCTURED_OUTPUT_SCHEMA;
 	if (envSnapshot.PI_SUBAGENT_TOOL_BUDGET === undefined) delete process.env[TOOL_BUDGET_ENV];
 	else process.env[TOOL_BUDGET_ENV] = envSnapshot.PI_SUBAGENT_TOOL_BUDGET;
+	if (envSnapshot.PI_SUBAGENT_REQUIRED_TOOLS === undefined) delete process.env[REQUIRED_CHILD_TOOLS_ENV];
+	else process.env[REQUIRED_CHILD_TOOLS_ENV] = envSnapshot.PI_SUBAGENT_REQUIRED_TOOLS;
+	if (envSnapshot.PI_SUBAGENT_TOOL_DIAGNOSTIC_PATH === undefined) delete process.env[CHILD_TOOL_DIAGNOSTIC_PATH_ENV];
+	else process.env[CHILD_TOOL_DIAGNOSTIC_PATH_ENV] = envSnapshot.PI_SUBAGENT_TOOL_DIAGNOSTIC_PATH;
 	if (envSnapshot.PI_SUBAGENT_ORCHESTRATOR_TARGET === undefined) delete process.env[SUBAGENT_ORCHESTRATOR_TARGET_ENV];
 	else process.env[SUBAGENT_ORCHESTRATOR_TARGET_ENV] = envSnapshot.PI_SUBAGENT_ORCHESTRATOR_TARGET;
 	if (envSnapshot.PI_SUBAGENT_ORCHESTRATOR_SESSION_ID === undefined) delete process.env[SUBAGENT_ORCHESTRATOR_SESSION_ID_ENV];
@@ -92,6 +111,8 @@ afterEach(() => {
 	else process.env[SUBAGENT_CHILD_AGENT_ENV] = envSnapshot.PI_SUBAGENT_CHILD_AGENT;
 	if (envSnapshot.PI_SUBAGENT_CHILD_INDEX === undefined) delete process.env[SUBAGENT_CHILD_INDEX_ENV];
 	else process.env[SUBAGENT_CHILD_INDEX_ENV] = envSnapshot.PI_SUBAGENT_CHILD_INDEX;
+	if (envSnapshot.PI_SUBAGENT_WATCHDOG_CHILD_CONFIG === undefined) delete process.env[CHILD_WATCHDOG_CONFIG_ENV];
+	else process.env[CHILD_WATCHDOG_CONFIG_ENV] = envSnapshot.PI_SUBAGENT_WATCHDOG_CHILD_CONFIG;
 });
 
 function setSupervisorEnv(): void {
@@ -131,6 +152,40 @@ describe("subagent prompt runtime", () => {
 		assert.equal(toolCall({ toolName: "write" }), undefined);
 	});
 
+	it("registers the native canonical steering inbox path", () => {
+		const dir = fs.mkdtempSync(path.join(os.tmpdir(), "subagent-steering-watch-runtime-"));
+		try {
+			const inbox = path.join(dir, "steer");
+			const nativeInbox = path.join(dir, "native-steer");
+			process.env[SUBAGENT_STEER_INBOX_ENV] = inbox;
+			const handlers = new Map<string, (payload?: unknown) => unknown>();
+			let watchedDir: fs.PathLike | undefined;
+			const fakeWatcher = { on() { return fakeWatcher; }, close() {} } as fs.FSWatcher;
+
+			registerSteeringInbox({
+				on(event: string, handler: (payload?: unknown) => unknown) {
+					handlers.set(event, handler);
+				},
+				sendUserMessage() {},
+			} as { on(event: string, handler: (payload?: unknown) => unknown): void; sendUserMessage(): void }, {
+				nativeRealpath(target) {
+					assert.equal(target, inbox);
+					return nativeInbox;
+				},
+				watch: ((target: fs.PathLike) => {
+					watchedDir = target;
+					return fakeWatcher;
+				}) as typeof fs.watch,
+			});
+
+			handlers.get("session_start")?.({});
+			assert.equal(watchedDir, nativeInbox);
+			handlers.get("session_shutdown")?.({});
+		} finally {
+			fs.rmSync(dir, { recursive: true, force: true });
+		}
+	});
+
 	it("delivers steering inbox requests as mid-run user messages", () => {
 		const dir = fs.mkdtempSync(path.join(os.tmpdir(), "subagent-steering-runtime-"));
 		try {
@@ -160,6 +215,122 @@ describe("subagent prompt runtime", () => {
 		} finally {
 			fs.rmSync(dir, { recursive: true, force: true });
 		}
+	});
+
+	it("does not acknowledge sendUserMessage until the correlated Pi input event arrives", () => {
+		const dir = fs.mkdtempSync(path.join(os.tmpdir(), "subagent-steering-ack-runtime-"));
+		try {
+			const inbox = path.join(dir, "inbox");
+			const capability = path.join(dir, "capability.json");
+			const ackDir = path.join(dir, "control", "steer-acks", "0");
+			process.env[SUBAGENT_STEER_INBOX_ENV] = inbox;
+			process.env[SUBAGENT_STEER_CAPABILITY_ENV] = capability;
+			process.env[SUBAGENT_STEER_ACK_DIR_ENV] = ackDir;
+			process.env[SUBAGENT_CHILD_INDEX_ENV] = "0";
+			const handlers = new Map<string, (payload?: unknown) => unknown>();
+			const sent: string[] = [];
+			registerSteeringInbox({
+				on(event: string, handler: (payload?: unknown) => unknown) { handlers.set(event, handler); },
+				sendUserMessage(content: string) { sent.push(content); },
+			} as never);
+			handlers.get("session_start")?.({});
+			writeSteerRequestToDir(inbox, { type: "steer", id: "first", ts: 1, message: "Focus on tests." });
+			handlers.get("message_start")?.({});
+			assert.equal(sent.length, 1);
+			assert.deepEqual(fs.existsSync(ackDir) ? fs.readdirSync(ackDir) : [], []);
+			handlers.get("input")?.({ source: "extension", streamingBehavior: "steer", text: sent[0] });
+			const acks = consumeSteerAcks(dir);
+			assert.equal(acks.length, 1);
+			assert.equal(acks[0]?.requestId, "first");
+			assert.equal(acks[0]?.state, "delivered");
+			assert.equal(acks[0]?.message, "Pi accepted the correlated steering input.");
+			handlers.get("session_shutdown")?.({});
+		} finally {
+			fs.rmSync(dir, { recursive: true, force: true });
+		}
+	});
+
+	it("correlates duplicate guidance FIFO without a visible marker", () => {
+		const dir = fs.mkdtempSync(path.join(os.tmpdir(), "subagent-steering-fifo-runtime-"));
+		try {
+			const inbox = path.join(dir, "inbox");
+			process.env[SUBAGENT_STEER_INBOX_ENV] = inbox;
+			process.env[SUBAGENT_STEER_CAPABILITY_ENV] = path.join(dir, "capability.json");
+			process.env[SUBAGENT_STEER_ACK_DIR_ENV] = path.join(dir, "control", "steer-acks", "0");
+			process.env[SUBAGENT_CHILD_INDEX_ENV] = "0";
+			const handlers = new Map<string, (payload?: unknown) => unknown>();
+			const sent: string[] = [];
+			registerSteeringInbox({ on(event: string, handler: (payload?: unknown) => unknown) { handlers.set(event, handler); }, sendUserMessage(content: string) { sent.push(content); } } as never);
+			handlers.get("session_start")?.({});
+			writeSteerRequestToDir(inbox, { type: "steer", id: "one", ts: 1, message: "same guidance" });
+			writeSteerRequestToDir(inbox, { type: "steer", id: "two", ts: 2, message: "same guidance" });
+			handlers.get("message_start")?.({});
+			handlers.get("input")?.({ source: "extension", streamingBehavior: "steer", text: sent[0] });
+			handlers.get("input")?.({ source: "extension", streamingBehavior: "steer", text: sent[1] });
+			assert.deepEqual(consumeSteerAcks(dir).map((ack) => ack.requestId), ["one", "two"]);
+			handlers.get("session_shutdown")?.({});
+		} finally {
+			fs.rmSync(dir, { recursive: true, force: true });
+		}
+	});
+
+	it("publishes an unsupported capability and failed acknowledgments without sendUserMessage", () => {
+		const dir = fs.mkdtempSync(path.join(os.tmpdir(), "subagent-steering-unsupported-runtime-"));
+		try {
+			const inbox = path.join(dir, "inbox");
+			process.env[SUBAGENT_STEER_INBOX_ENV] = inbox;
+			process.env[SUBAGENT_STEER_CAPABILITY_ENV] = path.join(dir, "capability.json");
+			process.env[SUBAGENT_STEER_ACK_DIR_ENV] = path.join(dir, "control", "steer-acks", "0");
+			process.env[SUBAGENT_CHILD_INDEX_ENV] = "0";
+			const handlers = new Map<string, (payload?: unknown) => unknown>();
+			registerSteeringInbox({ on(event: string, handler: (payload?: unknown) => unknown) { handlers.set(event, handler); } } as never);
+			handlers.get("session_start")?.({});
+			assert.equal(JSON.parse(fs.readFileSync(path.join(dir, "capability.json"), "utf-8")).supported, false);
+			writeSteerRequestToDir(inbox, { type: "steer", id: "unsupported", ts: 1, message: "guidance" });
+			handlers.get("message_start")?.({});
+			assert.equal(consumeSteerAcks(dir)[0]?.state, "failed");
+			handlers.get("session_shutdown")?.({});
+		} finally {
+			fs.rmSync(dir, { recursive: true, force: true });
+		}
+	});
+
+	it("registers child watchdog lifecycle handlers only when enabled by env", () => {
+		const handlersWithout = new Map<string, unknown[]>();
+		registerSubagentPromptRuntime({
+			on(event: string, handler: unknown) {
+				handlersWithout.set(event, [...(handlersWithout.get(event) ?? []), handler]);
+			},
+		} as { on(event: string, handler: unknown): void });
+		assert.equal(handlersWithout.get("agent_end")?.length ?? 0, 1, "headless auto-drain is always registered");
+
+		process.env[CHILD_WATCHDOG_CONFIG_ENV] = JSON.stringify({
+			enabled: true,
+			runId: "run-1",
+			agent: "worker",
+			childIndex: 0,
+			watchdogTailTimeoutMs: 1000,
+			agentEndTimeoutMs: 500,
+			maxWarnings: null,
+			lsp: { enabled: false, timeoutMs: 3000, maxFiles: 20, maxDiagnostics: 50 },
+			autoFollowBlockers: false,
+			autoFollowMaxAttempts: 3,
+			stalemateRepeats: 2,
+		});
+		const handlersWith = new Map<string, unknown[]>();
+		registerSubagentPromptRuntime({
+			on(event: string, handler: unknown) {
+				handlersWith.set(event, [...(handlersWith.get(event) ?? []), handler]);
+			},
+			getThinkingLevel() {
+				return "off";
+			},
+			sendMessage() {},
+		} as { on(event: string, handler: unknown): void; getThinkingLevel(): string; sendMessage(): void });
+
+		assert.ok((handlersWith.get("before_agent_start")?.length ?? 0) >= 2);
+		assert.ok((handlersWith.get("turn_end")?.length ?? 0) >= 1);
+		assert.ok((handlersWith.get("agent_end")?.length ?? 0) >= 2, "watchdog and auto-drain both observe agent_end");
 	});
 
 	it("registered structured_output tool accepts valid schema output and writes the capture file", async () => {
@@ -310,9 +481,11 @@ describe("subagent prompt runtime", () => {
 		const slashTextResult = { role: "custom", customType: "subagent-slash-text-result", content: "Subagent profiles" };
 		const notify = { role: "custom", customType: "subagent-notify", content: "Background task completed" };
 		const control = { role: "custom", customType: "subagent_control_notice", content: "needs attention" };
+		const watchdogWarning = { role: "custom", customType: SUBAGENT_WATCHDOG_WARNING_TYPE, content: "<subagent_watchdog>parent-only</subagent_watchdog>" };
+		const childWatchdogWarning = { role: "custom", customType: SUBAGENT_WATCHDOG_WARNING_TYPE, content: "<subagent_watchdog>child-visible</subagent_watchdog>", details: { source: "child" } };
 		const otherCustom = { role: "custom", customType: "other", content: "keep" };
 
-		assert.deepEqual(stripParentOnlySubagentMessages([user, instruction, slashResult, slashTextResult, notify, control, otherCustom]), [user, otherCustom]);
+		assert.deepEqual(stripParentOnlySubagentMessages([user, instruction, slashResult, slashTextResult, notify, control, watchdogWarning, childWatchdogWarning, otherCustom]), [user, otherCustom]);
 	});
 
 	it("strips prior parent subagent tool calls and results from forked child context", () => {
@@ -373,10 +546,10 @@ describe("subagent prompt runtime", () => {
 			},
 		} as { on(event: string, handler: (payload?: unknown) => unknown): void; getAllTools(): Array<{ name: string }>; registerTool(tool: { name: string }): void });
 
-		assert.deepEqual(registered, []);
+		assert.deepEqual(registered, ["subagent_wait"]);
 		handlers.get("session_start")?.({});
 		await handlers.get("before_agent_start")?.({ systemPrompt: BASE_PROMPT });
-		assert.deepEqual(registered, []);
+		assert.deepEqual(registered, ["subagent_wait"]);
 	});
 
 	it("keeps installed pi-intercom while filling only a missing child contact_supervisor tool", async () => {
@@ -397,7 +570,7 @@ describe("subagent prompt runtime", () => {
 		handlers.get("session_start")?.({});
 		await handlers.get("before_agent_start")?.({ systemPrompt: BASE_PROMPT });
 
-		assert.deepEqual(registered, ["contact_supervisor"]);
+		assert.deepEqual(registered, ["subagent_wait", "contact_supervisor"]);
 	});
 
 	it("registers native supervisor tools at runtime when pi-intercom is absent", async () => {
@@ -416,10 +589,46 @@ describe("subagent prompt runtime", () => {
 		} as { on(event: string, handler: (payload?: unknown) => unknown): void; getAllTools(): Array<{ name: string }>; registerTool(tool: { name: string }): void });
 
 		handlers.get("session_start")?.({});
-		assert.deepEqual(registered, ["contact_supervisor"]);
+		assert.deepEqual(registered, ["subagent_wait", "contact_supervisor"]);
 
 		await handlers.get("before_agent_start")?.({ systemPrompt: BASE_PROMPT });
-		assert.deepEqual(registered, ["contact_supervisor", "intercom"]);
+		assert.deepEqual(registered, ["subagent_wait", "contact_supervisor", "intercom"]);
+	});
+
+	it("records and explains requested tools missing from the child registry", async () => {
+		const dir = fs.mkdtempSync(path.join(os.tmpdir(), "subagent-tool-diagnostic-"));
+		try {
+			const diagnosticPath = path.join(dir, "tools.json");
+			const handlers = new Map<string, (payload?: unknown) => unknown>();
+			const available = ["read"];
+			process.env[REQUIRED_CHILD_TOOLS_ENV] = JSON.stringify(["read", "fixture_search"]);
+			process.env[CHILD_TOOL_DIAGNOSTIC_PATH_ENV] = diagnosticPath;
+			process.env[SUBAGENT_CHILD_AGENT_ENV] = "extension-worker";
+
+			registerSubagentPromptRuntime({
+				on(event: string, handler: (payload?: unknown) => unknown) {
+					handlers.set(event, handler);
+				},
+				getAllTools: () => available.map((name) => ({ name })),
+			} as { on(event: string, handler: (payload?: unknown) => unknown): void; getAllTools(): Array<{ name: string }> });
+
+			const missing = await handlers.get("before_agent_start")?.({ systemPrompt: BASE_PROMPT }) as { systemPrompt?: string } | undefined;
+			assert.deepEqual(readChildToolDiagnostic(diagnosticPath), {
+				agent: "extension-worker",
+				required: ["read", "fixture_search"],
+				available: ["read"],
+				missing: ["fixture_search"],
+			});
+			assert.match(missing?.systemPrompt ?? "", /requested unavailable child tools: fixture_search/);
+			assert.match(missing?.systemPrompt ?? "", /subagentOnlyExtensions/);
+
+			available.push("fixture_search");
+			const resolved = await handlers.get("before_agent_start")?.({ systemPrompt: BASE_PROMPT });
+			assert.equal(fs.existsSync(diagnosticPath), false);
+			assert.equal(resolved, undefined);
+		} finally {
+			fs.rmSync(dir, { recursive: true, force: true });
+		}
 	});
 
 	it("sets the child intercom session name from env during agent startup", async () => {
@@ -431,10 +640,11 @@ describe("subagent prompt runtime", () => {
 			on(event: string, handler: (payload: { systemPrompt: string }) => Promise<{ systemPrompt: string } | undefined>) {
 				if (event === "before_agent_start") beforeAgentStart = handler;
 			},
+			getAllTools: () => [{ name: "intercom" }, { name: "contact_supervisor" }],
 			setSessionName(name: string) {
 				sessionName = name;
 			},
-		} as { on(event: string, handler: (payload: { systemPrompt: string }) => Promise<{ systemPrompt: string } | undefined>): void; setSessionName(name: string): void });
+		} as { on(event: string, handler: (payload: { systemPrompt: string }) => Promise<{ systemPrompt: string } | undefined>): void; getAllTools(): Array<{ name: string }>; setSessionName(name: string): void });
 
 		await beforeAgentStart?.({ systemPrompt: BASE_PROMPT });
 
@@ -447,7 +657,8 @@ describe("subagent prompt runtime", () => {
 			on(event: string, handler: (payload: { systemPrompt: string }) => Promise<{ systemPrompt: string } | undefined>) {
 				if (event === "before_agent_start") beforeAgentStart = handler;
 			},
-		} as { on(event: string, handler: (payload: { systemPrompt: string }) => Promise<{ systemPrompt: string } | undefined>): void });
+			getAllTools: () => [{ name: "intercom" }, { name: "contact_supervisor" }],
+		} as { on(event: string, handler: (payload: { systemPrompt: string }) => Promise<{ systemPrompt: string } | undefined>): void; getAllTools(): Array<{ name: string }> });
 
 		assert.ok(beforeAgentStart, "expected before_agent_start handler");
 		process.env.PI_SUBAGENT_INHERIT_PROJECT_CONTEXT = "0";
@@ -466,7 +677,8 @@ describe("subagent prompt runtime", () => {
 			on(event: string, handler: (payload: { systemPrompt: string }) => Promise<{ systemPrompt: string } | undefined>) {
 				if (event === "before_agent_start") beforeAgentStart = handler;
 			},
-		} as { on(event: string, handler: (payload: { systemPrompt: string }) => Promise<{ systemPrompt: string } | undefined>): void });
+			getAllTools: () => [{ name: "intercom" }, { name: "contact_supervisor" }],
+		} as { on(event: string, handler: (payload: { systemPrompt: string }) => Promise<{ systemPrompt: string } | undefined>): void; getAllTools(): Array<{ name: string }> });
 
 		process.env.PI_SUBAGENT_INHERIT_PROJECT_CONTEXT = "1";
 		process.env.PI_SUBAGENT_INHERIT_SKILLS = "1";
@@ -491,9 +703,11 @@ describe("subagent prompt runtime", () => {
 		const slashResult = { role: "custom", customType: "subagent-slash-result", content: "## Orchestration" };
 		const subagentResult = { role: "toolResult", toolName: "subagent", content: "subagent results" };
 		const subagentCall = { role: "assistant", content: [{ type: "toolCall", name: "subagent", input: { agent: "worker" } }] };
+		const watchdogWarning = { role: "custom", customType: SUBAGENT_WATCHDOG_WARNING_TYPE, content: "<subagent_watchdog>parent-only</subagent_watchdog>" };
+		const childWatchdogWarning = { role: "custom", customType: SUBAGENT_WATCHDOG_WARNING_TYPE, content: "<subagent_watchdog>child-visible</subagent_watchdog>", details: { source: "child" } };
 		const otherCustom = { role: "custom", customType: "other", content: "keep" };
 
-		assert.deepEqual(contextHandler?.({ messages: [priorParentTurn, instruction, slashResult, subagentCall, subagentResult, otherCustom, currentTask] }), {
+		assert.deepEqual(contextHandler?.({ messages: [priorParentTurn, instruction, slashResult, subagentCall, subagentResult, watchdogWarning, childWatchdogWarning, otherCustom, currentTask] }), {
 			messages: [priorParentTurn, otherCustom, currentTask],
 		});
 	});

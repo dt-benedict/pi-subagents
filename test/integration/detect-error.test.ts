@@ -53,6 +53,16 @@ function assistantToolCall(toolName: string): Record<string, unknown> {
 	};
 }
 
+function assistantTextWithToolCall(text: string, toolName: string): Record<string, unknown> {
+	return {
+		role: "assistant",
+		content: [{ type: "text", text }, { type: "toolCall", name: toolName, input: {} }],
+		api: "test",
+		provider: "test",
+		model: "test",
+	};
+}
+
 describe("detectSubagentError", { skip: !available ? "utils not importable" : undefined }, () => {
 	// ---- Basic detection (must still work) ----
 
@@ -205,6 +215,16 @@ describe("detectSubagentError", { skip: !available ? "utils not importable" : un
 		const result = detectSubagentError(messages);
 		assert.equal(result.hasError, true,
 			"tool-call assistant message without text is not a recovery");
+	});
+
+	it("does not treat tool-use preamble text as a delivered answer", () => {
+		const messages = [
+			assistantTextWithToolCall("Checking connectivity…", "bash"),
+			toolResult("bash", "Command exited with code 1", true),
+		];
+		const result = detectSubagentError(messages);
+		assert.equal(result.hasError, true);
+		assert.equal(result.errorType, "bash");
 	});
 
 	it("does not treat empty/whitespace assistant message as recovery", () => {

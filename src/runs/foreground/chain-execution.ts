@@ -8,7 +8,7 @@ import type { AgentToolResult } from "@earendil-works/pi-agent-core";
 import type { ExtensionContext } from "@earendil-works/pi-coding-agent";
 import type { AgentConfig } from "../../agents/agents.ts";
 import { ChainClarifyComponent, type ChainClarifyResult, type BehaviorOverride } from "./chain-clarify.ts";
-import { getLiveAvailableModels, toModelInfo, type ModelInfo } from "../../shared/model-info.ts";
+import { toModelInfo, type ModelInfo } from "../../shared/model-info.ts";
 import {
 	resolveChainTemplates,
 	createChainDir,
@@ -63,9 +63,9 @@ import {
 	MAX_CONCURRENCY,
 	resolveChildMaxSubagentDepth,
 } from "../../shared/types.ts";
-import { resolveSubagentModelOverride } from "../shared/model-fallback.ts";
+import { resolveEffectiveSubagentModel } from "../shared/model-fallback.ts";
 import type { ModelScopeConfig } from "../shared/model-scope.ts";
-import { validateFileOnlyOutputMode } from "../shared/single-output.ts";
+import { injectSingleOutputInstruction, validateFileOnlyOutputMode } from "../shared/single-output.ts";
 import { buildWorkflowGraphSnapshot } from "../shared/workflow-graph.ts";
 import { ChainOutputValidationError, outputEntryFromResult, resolveOutputReferences, validateChainOutputBindings } from "../shared/chain-outputs.ts";
 import { createStructuredOutputRuntime } from "../shared/structured-output.ts";
@@ -88,7 +88,7 @@ interface ChainExecutionDetailsInput {
 	outputs?: ChainOutputMap;
 	currentFlatIndex?: number;
 	dynamicChildren?: Record<number, Array<{ agent: string; label?: string; flatIndex: number; itemKey: string; outputName?: string; structured?: boolean; error?: string }>>;
-	dynamicGroupStatuses?: Record<number, { status: "pending" | "running" | "completed" | "failed" | "paused" | "detached"; error?: string; acceptance?: SingleResult["acceptance"] }>;
+	dynamicGroupStatuses?: Record<number, { status: "pending" | "running" | "completed" | "failed" | "paused" | "stopped" | "detached"; error?: string; acceptance?: SingleResult["acceptance"] }>;
 }
 
 interface ParallelChainRunInput {
@@ -109,8 +109,8 @@ interface ParallelChainRunInput {
 	globalTaskIndex: number;
 	sessionDirForIndex: (idx?: number) => string | undefined;
 	sessionFileForIndex?: (idx?: number) => string | undefined;
-	sessionFileForTask?: (agentName: string, idx?: number) => string | undefined;
-	thinkingOverrideForTask?: (agentName: string, idx?: number) => AgentConfig["thinking"] | undefined;
+	sessionFileForTask?: (agentName: string, idx?: number, modelOverride?: string) => string | undefined;
+	thinkingOverrideForTask?: (agentName: string, idx?: number, modelOverride?: string) => AgentConfig["thinking"] | undefined;
 	shareEnabled: boolean;
 	artifactConfig: ArtifactConfig;
 	artifactsDir: string;
@@ -152,6 +152,7 @@ interface ParallelChainRunInput {
 	toolBudget?: ResolvedToolBudget;
 	configToolBudget?: ToolBudgetConfig;
 	globalSemaphore?: Semaphore;
+	dynamic?: boolean;
 }
 
 function buildChainExecutionDetails(input: ChainExecutionDetailsInput): Details {
@@ -230,6 +231,21 @@ async function runParallelChainTasks(input: ParallelChainRunInput): Promise<Sing
 	const concurrency = input.step.concurrency ?? MAX_CONCURRENCY;
 	const failFast = input.step.failFast ?? false;
 	let aborted = false;
+	const effectiveModels = input.step.parallel.map((task) => {
+		const taskAgentConfig = input.agents.find((agent) => agent.name === task.agent);
+		return resolveEffectiveSubagentModel(
+			task.model,
+			taskAgentConfig?.model,
+			input.ctx.model,
+			input.availableModels,
+			input.ctx.model?.provider,
+			{ scope: input.modelScope },
+		);
+	});
+	for (let taskIndex = 0; taskIndex < input.step.parallel.length; taskIndex++) {
+		const task = input.step.parallel[taskIndex]!;
+		input.sessionFileForTask?.(task.agent, input.globalTaskIndex + taskIndex, effectiveModels[taskIndex]);
+	}
 
 	const parallelResults = await mapConcurrent(
 		input.step.parallel,
@@ -248,9 +264,10 @@ async function runParallelChainTasks(input: ParallelChainRunInput): Promise<Sing
 
 			const taskTemplate = input.parallelTemplates[taskIndex] ?? "{previous}";
 			const behavior = suppressProgressForReadOnlyTask(input.parallelBehaviors[taskIndex]!, taskTemplate, input.originalTask);
+			const taskAgentConfig = input.agents.find((agent) => agent.name === task.agent);
 			const templateHasPrevious = taskTemplate.includes("{previous}");
 			const { prefix, suffix } = buildChainInstructions(
-				behavior,
+				{ ...behavior, output: false },
 				input.chainDir,
 				false,
 				templateHasPrevious ? undefined : input.prev,
@@ -263,14 +280,7 @@ async function runParallelChainTasks(input: ParallelChainRunInput): Promise<Sing
 			const cleanTask = taskStr;
 			taskStr = prefix + taskStr + suffix;
 
-			const taskAgentConfig = input.agents.find((agent) => agent.name === task.agent);
-			const effectiveModel = resolveSubagentModelOverride(
-				task.model ?? taskAgentConfig?.model,
-				input.ctx.model,
-				input.availableModels,
-				input.ctx.model?.provider,
-				{ scope: input.modelScope, source: task.model ? "explicit" : "inherited" },
-			);
+			const effectiveModel = effectiveModels[taskIndex];
 			const maxSubagentDepth = resolveChildMaxSubagentDepth(input.maxSubagentDepth, taskAgentConfig?.maxSubagentDepth);
 			const toolBudget = resolveChainToolBudget({ stepBudget: task.toolBudget, runBudget: input.toolBudget, agentBudget: taskAgentConfig?.toolBudget, configBudget: input.configToolBudget });
 			if (toolBudget.error) throw new Error(toolBudget.error);
@@ -282,6 +292,7 @@ async function runParallelChainTasks(input: ParallelChainRunInput): Promise<Sing
 			const outputPath = typeof behavior.output === "string"
 				? (path.isAbsolute(behavior.output) ? behavior.output : path.join(input.chainDir, behavior.output))
 				: undefined;
+			taskStr = injectSingleOutputInstruction(taskStr, outputPath, taskAgentConfig);
 			const interruptController = new AbortController();
 			if (input.foregroundControl) {
 				input.foregroundControl.currentAgent = task.agent;
@@ -310,9 +321,9 @@ async function runParallelChainTasks(input: ParallelChainRunInput): Promise<Sing
 				runId: input.runId,
 				index: input.globalTaskIndex + taskIndex,
 				sessionDir: input.sessionDirForIndex(input.globalTaskIndex + taskIndex),
-				sessionFile: input.sessionFileForTask?.(task.agent, input.globalTaskIndex + taskIndex)
+				sessionFile: input.sessionFileForTask?.(task.agent, input.globalTaskIndex + taskIndex, effectiveModel)
 					?? input.sessionFileForIndex?.(input.globalTaskIndex + taskIndex),
-				thinkingOverride: input.thinkingOverrideForTask?.(task.agent, input.globalTaskIndex + taskIndex),
+				thinkingOverride: input.thinkingOverrideForTask?.(task.agent, input.globalTaskIndex + taskIndex, effectiveModel),
 				share: input.shareEnabled,
 				artifactsDir: input.artifactConfig.enabled ? input.artifactsDir : undefined,
 				artifactConfig: input.artifactConfig,
@@ -331,7 +342,7 @@ async function runParallelChainTasks(input: ParallelChainRunInput): Promise<Sing
 				skills: behavior.skills === false ? [] : behavior.skills,
 				structuredOutput: structuredRuntime,
 				acceptance: task.acceptance,
-				acceptanceContext: { mode: "chain" },
+				acceptanceContext: { mode: "chain", dynamic: input.dynamic && task.acceptance === undefined },
 				timeoutMs: input.timeoutMs,
 				deadlineAt: input.deadlineAt,
 				turnBudget: input.turnBudget,
@@ -412,8 +423,8 @@ interface ChainExecutionParams {
 	shareEnabled: boolean;
 	sessionDirForIndex: (idx?: number) => string | undefined;
 	sessionFileForIndex?: (idx?: number) => string | undefined;
-	sessionFileForTask?: (agentName: string, idx?: number) => string | undefined;
-	thinkingOverrideForTask?: (agentName: string, idx?: number) => AgentConfig["thinking"] | undefined;
+	sessionFileForTask?: (agentName: string, idx?: number, modelOverride?: string) => string | undefined;
+	thinkingOverrideForTask?: (agentName: string, idx?: number, modelOverride?: string) => AgentConfig["thinking"] | undefined;
 	artifactsDir: string;
 	artifactConfig: ArtifactConfig;
 	includeProgress?: boolean;
@@ -557,7 +568,7 @@ export async function executeChain(params: ChainExecutionParams): Promise<ChainE
 	let templates: ResolvedTemplates = resolveChainTemplates(chainSteps);
 	const shouldClarify = clarify === true && ctx.hasUI && !hasParallelSteps;
 	let tuiBehaviorOverrides: (BehaviorOverride | undefined)[] | undefined;
-	const availableModels: ModelInfo[] = getLiveAvailableModels(ctx.modelRegistry).map(toModelInfo);
+	const availableModels: ModelInfo[] = ctx.modelRegistry.getAvailable().map(toModelInfo);
 	const availableSkills = discoverAvailableSkills(cwd ?? ctx.cwd);
 
 	if (shouldClarify) {
@@ -627,7 +638,7 @@ export async function executeChain(params: ChainExecutionParams): Promise<ChainE
 				return {
 					...step,
 					task: result.templates[i]!,
-					...(override?.model ? { model: override.model } : {}),
+					...(override?.model !== undefined ? { model: override.model } : {}),
 					...(override?.output !== undefined ? { output: override.output } : {}),
 					...("outputMode" in step && step.outputMode !== undefined ? { outputMode: step.outputMode } : {}),
 					...(override?.reads !== undefined ? { reads: override.reads } : {}),
@@ -768,7 +779,7 @@ export async function executeChain(params: ChainExecutionParams): Promise<ChainE
 				const detached = detachedIndexInStep >= 0 ? parallelResults[detachedIndexInStep] : undefined;
 				if (detached) {
 					return {
-						content: [{ type: "text", text: `Chain detached for intercom coordination at step ${stepIndex + 1} (${detached.agent}). Reply to the supervisor request first. After the child exits, start a fresh follow-up if needed.` }],
+						content: [{ type: "text", text: `Chain detached for intercom coordination at step ${stepIndex + 1} (${detached.agent}). Reply to the supervisor request first, then wait with subagent_wait({ id: "${runId}" }). Use subagent({ action: "status", id: "${runId}" }) to recover the result; do not resume or launch a replacement while it remains detached.` }],
 						details: buildChainExecutionDetails(makeDetailsInput({
 							currentStepIndex: stepIndex,
 							currentFlatIndex: globalTaskIndex - step.parallel.length + detachedIndexInStep,
@@ -869,7 +880,8 @@ export async function executeChain(params: ChainExecutionParams): Promise<ChainE
 					const effectiveGroupAcceptance = resolveEffectiveAcceptance({
 						explicit: step.acceptance,
 						agentName: step.parallel.agent,
-						task: step.parallel.task ?? originalTask,
+						acceptanceRole: agents.find((agent) => agent.name === step.parallel.agent)?.acceptanceRole,
+						task: (step.parallel.task ?? originalTask ?? "").replace(/\{task\}/g, originalTask ?? ""),
 						mode: "chain",
 						dynamicGroup: true,
 					});
@@ -964,6 +976,7 @@ export async function executeChain(params: ChainExecutionParams): Promise<ChainE
 				toolBudget: params.toolBudget,
 				configToolBudget: params.configToolBudget,
 				globalSemaphore,
+				dynamic: true,
 			});
 			globalTaskIndex = dynamicStartIndex + reservedDynamicItems;
 
@@ -988,7 +1001,7 @@ export async function executeChain(params: ChainExecutionParams): Promise<ChainE
 			const detached = detachedIndexInStep >= 0 ? parallelResults[detachedIndexInStep] : undefined;
 			if (detached) {
 				return {
-					content: [{ type: "text", text: `Chain detached for intercom coordination at step ${stepIndex + 1} (${detached.agent}). Reply to the supervisor request first. After the child exits, start a fresh follow-up if needed.` }],
+					content: [{ type: "text", text: `Chain detached for intercom coordination at step ${stepIndex + 1} (${detached.agent}). Reply to the supervisor request first, then wait with subagent_wait({ id: "${runId}" }). Use subagent({ action: "status", id: "${runId}" }) to recover the result; do not resume or launch a replacement while it remains detached.` }],
 					details: buildChainExecutionDetails(makeDetailsInput({
 						currentStepIndex: stepIndex,
 						currentFlatIndex: dynamicStartIndex + detachedIndexInStep,
@@ -1034,7 +1047,10 @@ export async function executeChain(params: ChainExecutionParams): Promise<ChainE
 			const effectiveGroupAcceptance = resolveEffectiveAcceptance({
 				explicit: step.acceptance,
 				agentName: step.parallel.agent,
-				task: step.parallel.task ?? originalTask,
+				acceptanceRole: agents.find((agent) => agent.name === step.parallel.agent)?.acceptanceRole,
+				task: materialized.parallel
+					.map((task) => (task.task ?? originalTask ?? "").replace(/\{task\}/g, originalTask ?? ""))
+					.join("\n"),
 				mode: "chain",
 				dynamicGroup: true,
 			});
@@ -1048,7 +1064,7 @@ export async function executeChain(params: ChainExecutionParams): Promise<ChainE
 				cwd: cwd ?? ctx.cwd,
 			});
 			dynamicGroupStatuses[stepIndex].acceptance = groupAcceptance;
-			const groupAcceptanceFailure = acceptanceFailureMessage(groupAcceptance);
+			const groupAcceptanceFailure = effectiveGroupAcceptance.explicit ? acceptanceFailureMessage(groupAcceptance) : undefined;
 			if (groupAcceptanceFailure) {
 				dynamicGroupStatuses[stepIndex] = { status: "failed", error: groupAcceptanceFailure, acceptance: groupAcceptance };
 				return buildChainExecutionErrorResult(groupAcceptanceFailure, makeDetailsInput({ currentStepIndex: stepIndex, currentFlatIndex: globalTaskIndex - dynamicParallelStep.parallel.length }));
@@ -1096,7 +1112,7 @@ export async function executeChain(params: ChainExecutionParams): Promise<ChainE
 
 			const templateHasPrevious = stepTemplate.includes("{previous}");
 			const { prefix, suffix } = buildChainInstructions(
-				behavior,
+				{ ...behavior, output: false },
 				chainDir,
 				isFirstProgress,
 				templateHasPrevious ? undefined : prev,
@@ -1110,17 +1126,19 @@ export async function executeChain(params: ChainExecutionParams): Promise<ChainE
 			stepTask = prefix + stepTask + suffix;
 
 			const explicitStepModel = tuiOverride?.model ?? seqStep.model;
-			const effectiveModel = resolveSubagentModelOverride(
-				explicitStepModel ?? agentConfig.model,
+			const effectiveModel = resolveEffectiveSubagentModel(
+				explicitStepModel,
+				agentConfig.model,
 				ctx.model,
 				availableModels,
 				ctx.model?.provider,
-				{ scope: modelScope, source: explicitStepModel ? "explicit" : "inherited" },
+				{ scope: modelScope },
 			);
 
 			const outputPath = typeof behavior.output === "string"
 				? (path.isAbsolute(behavior.output) ? behavior.output : path.join(chainDir, behavior.output))
 				: undefined;
+			stepTask = injectSingleOutputInstruction(stepTask, outputPath, agentConfig);
 			const validationError = validateFileOnlyOutputMode(behavior.outputMode, outputPath, `Chain step ${stepIndex + 1} (${seqStep.agent})`);
 			if (validationError) {
 				return buildChainExecutionErrorResult(validationError, makeDetailsInput({ currentStepIndex: stepIndex, currentFlatIndex: globalTaskIndex }));
@@ -1172,9 +1190,9 @@ export async function executeChain(params: ChainExecutionParams): Promise<ChainE
 				runId,
 				index: childIndex,
 				sessionDir: sessionDirForIndex(childIndex),
-				sessionFile: sessionFileForTask?.(seqStep.agent, childIndex)
+				sessionFile: sessionFileForTask?.(seqStep.agent, childIndex, effectiveModel)
 					?? sessionFileForIndex?.(childIndex),
-				thinkingOverride: thinkingOverrideForTask?.(seqStep.agent, childIndex),
+				thinkingOverride: thinkingOverrideForTask?.(seqStep.agent, childIndex, effectiveModel),
 				share: shareEnabled,
 				artifactsDir: artifactConfig.enabled ? artifactsDir : undefined,
 				artifactConfig,
@@ -1264,7 +1282,7 @@ export async function executeChain(params: ChainExecutionParams): Promise<ChainE
 			}
 			if (r.detached) {
 				return {
-					content: [{ type: "text", text: `Chain detached for intercom coordination at step ${stepIndex + 1} (${r.agent}). Reply to the supervisor request first. After the child exits, start a fresh follow-up if needed.` }],
+					content: [{ type: "text", text: `Chain detached for intercom coordination at step ${stepIndex + 1} (${r.agent}). Reply to the supervisor request first, then wait with subagent_wait({ id: "${runId}" }). Use subagent({ action: "status", id: "${runId}" }) to recover the result; do not resume or launch a replacement while it remains detached.` }],
 					details: buildChainExecutionDetails(makeDetailsInput({ currentStepIndex: stepIndex, currentFlatIndex: childIndex })),
 				};
 			}

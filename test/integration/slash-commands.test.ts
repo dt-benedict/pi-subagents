@@ -4,7 +4,10 @@ import * as os from "node:os";
 import * as path from "node:path";
 import { beforeEach, describe, it } from "node:test";
 
+import { scheduledRunStorePath } from "../../src/runs/background/scheduled-runs.ts";
+import { SUBAGENT_FANOUT_CHILD_ENV } from "../../src/runs/shared/pi-args.ts";
 import { ASYNC_DIR } from "../../src/shared/types.ts";
+import type { WatchdogReviewFunction } from "../../src/watchdog/runtime.ts";
 
 const SLASH_RESULT_TYPE = "subagent-slash-result";
 const SLASH_SUBAGENT_REQUEST_EVENT = "subagent:slash:request";
@@ -51,13 +54,19 @@ interface SlashLiveStateModule {
 	resolveSlashMessageDetails?: typeof import("../../src/slash/slash-live-state.ts").resolveSlashMessageDetails;
 }
 
+interface WatchdogRegisterModule {
+	registerMainWatchdog?: typeof import("../../src/watchdog/register-main.ts").registerMainWatchdog;
+}
+
 let registerSlashCommands: RegisterSlashCommandsModule["registerSlashCommands"];
+let registerMainWatchdog: WatchdogRegisterModule["registerMainWatchdog"];
 let clearSlashSnapshots: SlashLiveStateModule["clearSlashSnapshots"];
 let getSlashRenderableSnapshot: SlashLiveStateModule["getSlashRenderableSnapshot"];
 let resolveSlashMessageDetails: SlashLiveStateModule["resolveSlashMessageDetails"];
 let available = true;
 try {
 	({ registerSlashCommands } = await import("../../src/slash/slash-commands.ts") as RegisterSlashCommandsModule);
+	({ registerMainWatchdog } = await import("../../src/watchdog/register-main.ts") as WatchdogRegisterModule);
 	({ clearSlashSnapshots, getSlashRenderableSnapshot, resolveSlashMessageDetails } = await import("../../src/slash/slash-live-state.ts") as SlashLiveStateModule);
 } catch {
 	available = false;
@@ -88,6 +97,9 @@ function createState(cwd: string) {
 		baseCwd: cwd,
 		currentSessionId: null,
 		asyncJobs: new Map(),
+		foregroundRuns: new Map(),
+		foregroundControls: new Map(),
+		lastForegroundControlId: null,
 		cleanupTimers: new Map(),
 		lastUiContext: null,
 		poller: null,
@@ -134,12 +146,14 @@ function createCommandContext(
 		setStatus: (key: string, text: string | undefined) => void;
 		setToolsExpanded: (expanded: boolean) => void;
 		sessionManager: unknown;
-		model: { provider: string; id: string };
 		modelRegistry: {
 			refresh?: () => void;
 			getAvailable: () => Array<{ provider: string; id: string; reasoning?: boolean; thinkingLevelMap?: Record<string, string | null> }>;
 			find?: (provider: string, id: string) => unknown;
+			hasConfiguredAuth?: (model: unknown) => boolean;
 		};
+		model: { provider: string; id: string };
+		thinkingLevel: string;
 	}> = {},
 ) {
 	return {
@@ -155,7 +169,8 @@ function createCommandContext(
 			custom: overrides.custom ?? (async () => undefined),
 		},
 		model: overrides.model,
-		modelRegistry: overrides.modelRegistry ?? { getAvailable: () => [], find: () => undefined },
+		thinkingLevel: overrides.thinkingLevel,
+		modelRegistry: overrides.modelRegistry ?? { getAvailable: () => [], find: () => undefined, hasConfiguredAuth: () => true },
 		sessionManager: overrides.sessionManager ?? {
 			getSessionFile: () => null,
 			getSessionId: () => "session-test",
@@ -176,6 +191,25 @@ async function withTempProject<T>(prefix: string, fn: (root: string) => Promise<
 
 function writeProjectChain(root: string, fileName: string, content: string): void {
 	fs.writeFileSync(path.join(root, ".pi", "chains", fileName), content, "utf-8");
+}
+
+function createWatchdogHarness(review?: WatchdogReviewFunction) {
+	const commands = new Map<string, RegisteredSlashCommand>();
+	const renderers = new Map<string, (message: { content: string; details?: unknown }, options: { expanded: boolean }, theme: { fg(name: string, value: string): string; bold(value: string): string }) => { render(width: number): string[] } | undefined>();
+	const sent: unknown[] = [];
+	const pi = {
+		events: createEventBus(),
+		on() {},
+		registerCommand(name: string, spec: RegisteredSlashCommand) { commands.set(name, spec); },
+		registerShortcut() {},
+		registerMessageRenderer(type: string, renderer: (message: { content: string; details?: unknown }, options: { expanded: boolean }, theme: { fg(name: string, value: string): string; bold(value: string): string }) => { render(width: number): string[] } | undefined) {
+			renderers.set(type, renderer);
+		},
+		getThinkingLevel() { return "medium" as const; },
+		sendMessage(message: unknown) { sent.push(message); },
+	};
+	const runtime = registerMainWatchdog!(pi as never, review ? { review } : undefined);
+	return { commands, renderers, runtime, sent };
 }
 
 async function captureSlashCommandParams(
@@ -223,6 +257,219 @@ async function captureSlashCommandParams(
 		return { params: requestedParams, notifications };
 	});
 }
+
+describe("subagents watchdog slash command", { skip: !available ? "watchdog command not importable" : undefined }, () => {
+	it("shows default-off status with runtime state, sources, and review seam", async () => {
+		await withIsolatedHome(async () => {
+			await withTempProject("pi-watchdog-status-", async (root) => {
+				const { commands, sent } = createWatchdogHarness();
+				await commands.get("subagents-watchdog")!.handler("", createCommandContext({ cwd: root }));
+
+				const content = String((sent[0] as { content?: unknown }).content ?? "");
+				assert.match(content, /Subagent watchdog/);
+				assert.match(content, /Main: off \(default off\)/);
+				assert.match(content, /Runtime: idle/);
+				assert.match(content, /Review model call: real model review/);
+				assert.match(content, /Sources:/);
+			});
+		});
+	});
+
+	it("recommends and saves a strong complementary watchdog model", async () => {
+		await withIsolatedHome(async () => {
+			await withTempProject("pi-watchdog-model-", async (root) => {
+				const gpt = { provider: "openai-codex", id: "gpt-5.5", reasoning: true };
+				const opus = { provider: "anthropic", id: "claude-opus-4-8", reasoning: true };
+				const models = [gpt, opus];
+				const modelRegistry = {
+					getAvailable: () => models,
+					find: (provider: string, id: string) => models.find((entry) => entry.provider === provider && entry.id === id),
+					hasConfiguredAuth: (model: unknown) => Boolean(model),
+				};
+				const ctx = createCommandContext({ cwd: root, model: gpt, modelRegistry });
+				const { commands, sent } = createWatchdogHarness();
+
+				await commands.get("subagents-watchdog")!.handler("recommend-model", ctx);
+				await commands.get("subagents-watchdog")!.handler("model recommended", ctx);
+
+				const recommendation = String((sent[0] as { content?: unknown }).content ?? "");
+				assert.match(recommendation, /Recommended: anthropic\/claude-opus-4-8:high/);
+				const settingsPath = path.join(process.env.HOME!, ".pi", "agent", "settings.json");
+				const settings = JSON.parse(fs.readFileSync(settingsPath, "utf-8"));
+				assert.equal(settings.subagents.watchdog.main.model, "anthropic/claude-opus-4-8");
+				assert.equal(settings.subagents.watchdog.main.thinking, "high");
+				assert.equal(settings.subagents.watchdog.enabled, undefined);
+				assert.match(String((sent[1] as { content?: unknown }).content ?? ""), /Run \/subagents-watchdog on if the watchdog is still off/);
+			});
+		});
+	});
+
+	it("supports session-scoped recommended watchdog models without writing settings", async () => {
+		await withIsolatedHome(async () => {
+			await withTempProject("pi-watchdog-session-model-", async (root) => {
+				const opus = { provider: "anthropic", id: "claude-opus-4-8", reasoning: true };
+				const gpt = { provider: "openai-codex", id: "gpt-5.5", reasoning: true };
+				const models = [opus, gpt];
+				const modelRegistry = {
+					getAvailable: () => models,
+					find: (provider: string, id: string) => models.find((entry) => entry.provider === provider && entry.id === id),
+					hasConfiguredAuth: (model: unknown) => Boolean(model),
+				};
+				const { commands, sent } = createWatchdogHarness();
+
+				await commands.get("subagents-watchdog")!.handler("session model recommended", createCommandContext({ cwd: root, model: opus, modelRegistry }));
+
+				assert.equal(fs.existsSync(path.join(process.env.HOME!, ".pi", "agent", "settings.json")), false);
+				const content = String((sent[0] as { content?: unknown }).content ?? "");
+				assert.match(content, /session model: openai-codex\/gpt-5\.5:high/);
+				assert.match(content, /Main model: openai-codex\/gpt-5\.5 \(session override\)/);
+				assert.match(content, /Main thinking: high/);
+			});
+		});
+	});
+
+	it("shows explicit watchdog model thinking accurately when no thinking is configured", async () => {
+		await withIsolatedHome(async () => {
+			await withTempProject("pi-watchdog-status-model-", async (root) => {
+				const settingsPath = path.join(process.env.HOME!, ".pi", "agent", "settings.json");
+				fs.mkdirSync(path.dirname(settingsPath), { recursive: true });
+				fs.writeFileSync(settingsPath, JSON.stringify({ subagents: { watchdog: { enabled: true, main: { model: "openai-codex/gpt-5.5" } } } }, null, 2), "utf-8");
+				const gpt = { provider: "openai-codex", id: "gpt-5.5", reasoning: true };
+				const opus = { provider: "anthropic", id: "claude-opus-4-8", reasoning: true };
+				const models = [gpt, opus];
+				const modelRegistry = {
+					getAvailable: () => models,
+					find: (provider: string, id: string) => models.find((entry) => entry.provider === provider && entry.id === id),
+					hasConfiguredAuth: (model: unknown) => Boolean(model),
+				};
+				const { commands, sent } = createWatchdogHarness();
+
+				await commands.get("subagents-watchdog")!.handler("status", createCommandContext({ cwd: root, model: gpt, modelRegistry }));
+
+				const content = String((sent[0] as { content?: unknown }).content ?? "");
+				assert.match(content, /Main model: openai-codex\/gpt-5\.5 \(configured\)/);
+				assert.match(content, /Main thinking: off \(default for explicit watchdog model\)/);
+			});
+		});
+	});
+
+	it("writes only user watchdog enabled settings and preserves existing settings", async () => {
+		await withIsolatedHome(async () => {
+			await withTempProject("pi-watchdog-toggle-", async (root) => {
+				const settingsPath = path.join(process.env.HOME!, ".pi", "agent", "settings.json");
+				const projectSettingsPath = path.join(root, ".pi", "settings.json");
+				fs.mkdirSync(path.dirname(settingsPath), { recursive: true });
+				fs.writeFileSync(settingsPath, JSON.stringify({
+					other: true,
+					subagents: {
+						agentOverrides: { scout: { model: "openai/test" } },
+						watchdog: { agentEndTimeoutMs: 1234, main: { enabled: false, model: "openai/watchdog" } },
+					},
+				}, null, 2), "utf-8");
+				fs.writeFileSync(projectSettingsPath, JSON.stringify({ subagents: { defaultModel: "anthropic/project" } }, null, 2), "utf-8");
+				const projectBefore = fs.readFileSync(projectSettingsPath, "utf-8");
+				const { commands, sent } = createWatchdogHarness();
+
+				await commands.get("subagents-watchdog")!.handler("on", createCommandContext({ cwd: root }));
+				let settings = JSON.parse(fs.readFileSync(settingsPath, "utf-8"));
+				assert.equal(settings.other, true);
+				assert.equal(settings.subagents.agentOverrides.scout.model, "openai/test");
+				assert.equal(settings.subagents.watchdog.agentEndTimeoutMs, 1234);
+				assert.equal(settings.subagents.watchdog.enabled, true);
+				assert.equal(settings.subagents.watchdog.main.enabled, true);
+				assert.equal(settings.subagents.watchdog.main.model, "openai/watchdog");
+				assert.equal(fs.readFileSync(projectSettingsPath, "utf-8"), projectBefore);
+
+				await commands.get("subagents-watchdog")!.handler("off", createCommandContext({ cwd: root }));
+				settings = JSON.parse(fs.readFileSync(settingsPath, "utf-8"));
+				assert.equal(settings.subagents.watchdog.enabled, false);
+				assert.equal(settings.subagents.watchdog.main.enabled, false);
+				assert.match(String((sent[0] as { content?: unknown }).content ?? ""), /saved to user settings/);
+			});
+		});
+	});
+
+	it("uses session on/off overrides without writing settings files", async () => {
+		await withIsolatedHome(async () => {
+			await withTempProject("pi-watchdog-session-", async (root) => {
+				const settingsPath = path.join(process.env.HOME!, ".pi", "agent", "settings.json");
+				const projectSettingsPath = path.join(root, ".pi", "settings.json");
+				const { commands, sent } = createWatchdogHarness();
+
+				await commands.get("subagents-watchdog")!.handler("session on", createCommandContext({ cwd: root }));
+				await commands.get("subagents-watchdog")!.handler("session off", createCommandContext({ cwd: root }));
+
+				assert.equal(fs.existsSync(settingsPath), false);
+				assert.equal(fs.existsSync(projectSettingsPath), false);
+				assert.match(String((sent[0] as { content?: unknown }).content ?? ""), /session override: on/i);
+				assert.match(String((sent[1] as { content?: unknown }).content ?? ""), /session override: off/i);
+			});
+		});
+	});
+
+	it("sends deterministic concern and blocker warning messages through the renderer path", async () => {
+		await withIsolatedHome(async () => {
+			const { commands, renderers, sent } = createWatchdogHarness();
+			await commands.get("subagents-watchdog")!.handler("test concern check the concern", createCommandContext());
+			await commands.get("subagents-watchdog")!.handler("test blocker check the blocker", createCommandContext());
+
+			const concern = sent[0] as { customType?: string; content?: string; display?: boolean; details?: Record<string, unknown> };
+			const blocker = sent[1] as { customType?: string; content?: string; display?: boolean; details?: Record<string, unknown> };
+			assert.equal(concern.customType, "subagent_watchdog_warning");
+			assert.equal(concern.display, true);
+			assert.equal(concern.details?.severity, "concern");
+			assert.equal(concern.details?.source, "main");
+			assert.equal(concern.details?.state, "displayed");
+			assert.match(concern.content ?? "", /source="main"/);
+			assert.match(concern.content ?? "", /<state>displayed<\/state>/);
+			assert.match(concern.content ?? "", /<recommended_action>/);
+			assert.equal(blocker.details?.severity, "blocker");
+			assert.match(blocker.content ?? "", /<blocker_guidance>/);
+
+			const renderer = renderers.get("subagent_watchdog_warning")!;
+			const rendered = renderer(blocker as never, { expanded: true }, { fg: (_name, value) => value, bold: (value) => value })!.render(100).join("\n");
+			assert.match(rendered, /Subagent watchdog Blocker \(displayed\): check the blocker/);
+			assert.match(rendered, /Manual \/subagents-watchdog test blocker message/);
+		});
+	});
+
+	it("sends accepted review warnings as visible custom watchdog messages", async () => {
+		await withIsolatedHome(async () => {
+			await withTempProject("pi-watchdog-review-warning-", async (root) => {
+				const review: WatchdogReviewFunction = (request) => {
+					assert.equal(request.emitWarning({
+						severity: "concern",
+						category: "test-gap",
+						confidence: "high",
+						source: "main",
+						summary: "Focused validation is missing",
+						evidence: "The reviewed turn delta says changes were made but contains no test command.",
+						recommendedAction: "Run the focused watchdog tests before accepting the turn.",
+					}), true);
+					return { stopReason: "stop" };
+				};
+				const { runtime, sent } = createWatchdogHarness(review);
+
+				runtime.setSessionEnabled(true, root);
+				runtime.handleBeforeAgentStart({ prompt: "Patch watchdog runtime." }, { cwd: root });
+				runtime.handleTurnEnd({
+					type: "turn_end",
+					message: { role: "assistant", content: "Changed watchdog runtime without running tests." },
+					toolResults: [{ role: "toolResult", toolName: "edit", content: "Edited src/watchdog/runtime.ts", isError: false }],
+				}, { cwd: root });
+				await runtime.handleAgentEnd({ type: "agent_end", messages: [] }, { cwd: root });
+
+				const message = sent[0] as { customType?: string; content?: string; display?: boolean; details?: Record<string, unknown> };
+				assert.equal(message.customType, "subagent_watchdog_warning");
+				assert.equal(message.display, true);
+				assert.equal(message.details?.state, "displayed");
+				assert.equal(message.details?.summary, "Focused validation is missing");
+				assert.match(message.content ?? "", /<subagent_watchdog/);
+				assert.match(message.content ?? "", /<recommended_action>/);
+			});
+		});
+	});
+});
 
 describe("slash command custom message delivery", { skip: !available ? "slash-commands.ts not importable" : undefined }, () => {
 	beforeEach(() => {
@@ -1285,8 +1532,90 @@ describe("subagents admin slash command", { skip: !available ? "slash-commands.t
 		});
 	});
 
+	it("treats agent and scope selector cancellation as a silent no-op", async () => {
+		await withIsolatedHome(async () => {
+			await withTempProject("pi-subagents-admin-cancel-", async (root) => {
+				const sent: unknown[] = [];
+				const notifications: string[] = [];
+				const commands = registerAdmin(sent);
+
+				await commands.get("subagents")!.handler("", createCommandContext({
+					cwd: root,
+					hasUI: true,
+					select: async () => undefined,
+					notify: (message) => notifications.push(message),
+				}));
+
+				await commands.get("subagents")!.handler("worker model", createCommandContext({
+					cwd: root,
+					hasUI: true,
+					modelRegistry: { getAvailable: () => [{ provider: "test", id: "new-model", reasoning: true }] },
+					select: async (title) => title.startsWith("Select model") ? "test/new-model" : undefined,
+					notify: (message) => notifications.push(message),
+				}));
+
+				assert.deepEqual(sent, []);
+				assert.deepEqual(notifications, []);
+				assert.equal(fs.existsSync(path.join(root, ".pi", "settings.json")), false);
+			});
+		});
+	});
+
+	it("reports duplicate names as ambiguous without UI", async () => {
+		await withIsolatedHome(async () => {
+			await withTempProject("pi-subagents-admin-ambiguous-", async (root) => {
+				fs.writeFileSync(path.join(root, ".pi", "agents", "worker.md"), "---\nname: worker\ndescription: Project worker\n---\n\nWork.\n", "utf-8");
+				const sent: unknown[] = [];
+				const commands = registerAdmin(sent);
+				await commands.get("subagents")!.handler("worker", createCommandContext({ cwd: root }));
+				assert.equal(sent.length, 1);
+				const content = (sent[0] as { content?: string }).content ?? "";
+				assert.match(content, /Subagent 'worker' is ambiguous/);
+				assert.match(content, /project:/);
+				assert.match(content, /builtin:/);
+			});
+		});
+	});
+
+	it("keeps same-source duplicate agents distinct in interactive pickers", async () => {
+		await withIsolatedHome(async () => {
+			await withTempProject("pi-subagents-admin-same-source-", async (root) => {
+				const localPath = path.join(process.env.PI_CODING_AGENT_DIR!, "agents", "duplicate-admin-agent.md");
+				const extraDir = path.join(root, "extra-agents");
+				const extraPath = path.join(extraDir, "duplicate-admin-agent.md");
+				fs.mkdirSync(path.dirname(localPath), { recursive: true });
+				fs.mkdirSync(extraDir, { recursive: true });
+				const frontmatter = "---\nname: duplicate-admin-agent\ndescription: Duplicate agent\nmodel: test/model\n---\n\n";
+				fs.writeFileSync(localPath, `${frontmatter}Local prompt.\n`, "utf-8");
+				fs.writeFileSync(extraPath, `${frontmatter}Extra prompt.\n`, "utf-8");
+				const previousExtraDirs = process.env.PI_SUBAGENT_EXTRA_AGENT_DIRS;
+				process.env.PI_SUBAGENT_EXTRA_AGENT_DIRS = extraDir;
+				try {
+					const sent: unknown[] = [];
+					const commands = registerAdmin(sent);
+					await commands.get("subagents")!.handler("duplicate-admin-agent details", createCommandContext({
+						cwd: root,
+						hasUI: true,
+						select: async (_title, choices) => {
+							assert.equal(choices.length, 2);
+							assert.ok(choices.some((choice) => choice.includes(localPath)));
+							assert.ok(choices.some((choice) => choice.includes(extraPath)));
+							return choices.find((choice) => choice.includes(localPath));
+						},
+					}));
+					const content = (sent[0] as { content?: string }).content ?? "";
+					assert.ok(content.split("\n").includes(`Path: ${localPath}`));
+				} finally {
+					if (previousExtraDirs === undefined) delete process.env.PI_SUBAGENT_EXTRA_AGENT_DIRS;
+					else process.env.PI_SUBAGENT_EXTRA_AGENT_DIRS = previousExtraDirs;
+				}
+			});
+		});
+	});
+
 	it("updates a project agent model without dumping metadata first", async () => {
-		await withTempProject("pi-subagents-admin-model-", async (root) => {
+		await withIsolatedHome(async () => {
+			await withTempProject("pi-subagents-admin-model-", async (root) => {
 			const agentPath = path.join(root, ".pi", "agents", "worker.md");
 			fs.writeFileSync(agentPath, `---\nname: worker\ndescription: Test worker\nmodel: anthropic/claude-sonnet-4-6\n---\n\nDo work.\n`, "utf-8");
 			const sent: unknown[] = [];
@@ -1311,6 +1640,7 @@ describe("subagents admin slash command", { skip: !available ? "slash-commands.t
 			assert.match(fs.readFileSync(agentPath, "utf-8"), /^model: bluebox-azure-openai\/gpt-5_6-sol$/m);
 			assert.equal(sent.length, 1, "only the compact confirmation should enter the conversation");
 			assert.match((sent[0] as { content?: string }).content ?? "", /Updated 'worker' model/);
+			});
 		});
 	});
 
@@ -1341,6 +1671,28 @@ describe("subagents admin slash command", { skip: !available ? "slash-commands.t
 				const settings = JSON.parse(fs.readFileSync(settingsPath, "utf-8"));
 				assert.equal(settings.subagents.disableBuiltins, true);
 				assert.equal(settings.subagents.agentOverrides.worker.model, "bluebox-azure-openai/gpt-5_6-luna");
+			});
+		});
+	});
+
+	it("does not snapshot global disableThinking into an unrelated builtin override", async () => {
+		await withIsolatedHome(async () => {
+			await withTempProject("pi-subagents-admin-global-thinking-", async (root) => {
+				const settingsPath = path.join(process.env.PI_CODING_AGENT_DIR!, "settings.json");
+				fs.mkdirSync(path.dirname(settingsPath), { recursive: true });
+				fs.writeFileSync(settingsPath, JSON.stringify({ subagents: { disableThinking: true } }, null, 2), "utf-8");
+				const commands = registerAdmin([]);
+				await commands.get("subagents")!.handler("worker model", createCommandContext({
+					cwd: root,
+					hasUI: true,
+					modelRegistry: { getAvailable: () => [{ provider: "test", id: "new-model", reasoning: true }] },
+					select: async () => "test/new-model",
+				}));
+
+				assert.deepEqual(JSON.parse(fs.readFileSync(settingsPath, "utf-8")).subagents, {
+					disableThinking: true,
+					agentOverrides: { worker: { model: "test/new-model" } },
+				});
 			});
 		});
 	});
@@ -1384,15 +1736,165 @@ describe("subagents admin slash command", { skip: !available ? "slash-commands.t
 		});
 	});
 
-	it("round-trips a system prompt through the configured external editor", async () => {
-		await withTempProject("pi-subagents-admin-prompt-", async (root) => {
+	it("uses the inherited session model's thinking capabilities and warns on refresh failure", async () => {
+		await withIsolatedHome(async () => {
+			await withTempProject("pi-subagents-admin-inherited-thinking-", async (root) => {
+				fs.writeFileSync(path.join(root, ".pi", "agents", "auditor.md"), "---\nname: auditor\ndescription: Audit things\n---\n\nAudit.\n", "utf-8");
+				const notifications: Array<{ message: string; type?: string }> = [];
+				const commands = registerAdmin([]);
+				await commands.get("subagents")!.handler("auditor thinking", createCommandContext({
+					cwd: root,
+					hasUI: true,
+					model: { provider: "test", id: "plain-model" },
+					modelRegistry: {
+						refresh: () => { throw new Error("invalid models.json"); },
+						getAvailable: () => [{ provider: "test", id: "plain-model", reasoning: false }],
+					},
+					select: async (title, choices) => {
+						assert.match(title, /Session model: test\/plain-model/);
+						assert.deepEqual(choices, ["Default / inherit session thinking", "off"]);
+						return undefined;
+					},
+					notify: (message, type) => notifications.push({ message, type }),
+				}));
+
+				assert.equal(notifications.length, 1);
+				assert.equal(notifications[0]?.type, "warning");
+				assert.match(notifications[0]?.message ?? "", /using the last loaded choices.*invalid models\.json/);
+			});
+		});
+	});
+
+	it("does not pin inherited settings when editing a project-owned field", async () => {
+		await withIsolatedHome(async () => {
+			await withTempProject("pi-subagents-admin-cross-scope-", async (root) => {
+				const agentPath = path.join(root, ".pi", "agents", "worker.md");
+				fs.writeFileSync(agentPath, "---\nname: worker\ndescription: Test worker\n---\n\nDo work.\n", "utf-8");
+				const settingsPath = path.join(process.env.HOME!, ".pi", "agent", "settings.json");
+				fs.mkdirSync(path.dirname(settingsPath), { recursive: true });
+				fs.writeFileSync(settingsPath, JSON.stringify({
+					subagents: { agentOverrides: { worker: { thinking: "high" } } },
+				}, null, 2));
+
+				const commands = registerAdmin([]);
+				await commands.get("subagents")!.handler("worker model", createCommandContext({
+					cwd: root,
+					hasUI: true,
+					modelRegistry: { getAvailable: () => [{ provider: "bluebox-azure-openai", id: "gpt-5_6-sol", reasoning: true }] },
+					select: async (_title, choices) => {
+						const projectAgent = choices.find((choice) => choice.startsWith("worker [project]"));
+						if (projectAgent) return projectAgent;
+						assert.ok(choices.includes("bluebox-azure-openai/gpt-5_6-sol"));
+						return "bluebox-azure-openai/gpt-5_6-sol";
+					},
+				}));
+
+				const updated = fs.readFileSync(agentPath, "utf-8");
+				assert.match(updated, /^model: bluebox-azure-openai\/gpt-5_6-sol$/m);
+				assert.doesNotMatch(updated, /^thinking:/m);
+				assert.doesNotMatch(updated, /^systemPromptMode:/m);
+				assert.doesNotMatch(updated, /^inheritProjectContext:/m);
+				assert.equal(JSON.parse(fs.readFileSync(settingsPath, "utf-8")).subagents.agentOverrides.worker.thinking, "high");
+			});
+		});
+	});
+
+	it("does not write definitions from PI_SUBAGENT_EXTRA_AGENT_DIRS", async () => {
+		await withIsolatedHome(async () => {
+			await withTempProject("pi-subagents-admin-extra-", async (root) => {
+				const extraDir = path.join(root, "extra-agents");
+				const agentPath = path.join(extraDir, "worker.md");
+				fs.mkdirSync(extraDir, { recursive: true });
+				const original = "---\nname: worker\ndescription: Read-only worker\nmodel: anthropic/claude-sonnet-4-6\n---\n\nDo work.\n";
+				fs.writeFileSync(agentPath, original, "utf-8");
+				const previousExtraDirs = process.env.PI_SUBAGENT_EXTRA_AGENT_DIRS;
+				process.env.PI_SUBAGENT_EXTRA_AGENT_DIRS = extraDir;
+				try {
+					const commands = registerAdmin([]);
+					await commands.get("subagents")!.handler("worker model", createCommandContext({
+						cwd: root,
+						hasUI: true,
+						modelRegistry: { getAvailable: () => [{ provider: "bluebox-azure-openai", id: "gpt-5_6-sol", reasoning: true }] },
+						select: async (_title, choices) =>
+							choices.find((choice) => choice.startsWith("worker [user]"))
+							?? "bluebox-azure-openai/gpt-5_6-sol",
+					}));
+					assert.equal(fs.readFileSync(agentPath, "utf-8"), original);
+				} finally {
+					if (previousExtraDirs === undefined) delete process.env.PI_SUBAGENT_EXTRA_AGENT_DIRS;
+					else process.env.PI_SUBAGENT_EXTRA_AGENT_DIRS = previousExtraDirs;
+				}
+			});
+		});
+	});
+
+	it("respects package-owned fields and uses settings only for unset package fields", async () => {
+		await withIsolatedHome(async () => {
+			await withTempProject("pi-subagents-admin-package-", async (root) => {
+				const packageRoot = path.join(root, ".pi", "npm", "node_modules", "admin-package");
+				const agentPath = path.join(packageRoot, "agents", "package-admin-agent.md");
+				fs.mkdirSync(path.dirname(agentPath), { recursive: true });
+				fs.writeFileSync(path.join(packageRoot, "package.json"), JSON.stringify({
+					name: "admin-package",
+					"pi-subagents": { agents: ["./agents"] },
+				}), "utf-8");
+				const original = "---\nname: package-admin-agent\ndescription: Package agent\nmodel: test/original\n---\n\nPackage prompt.\n";
+				fs.writeFileSync(agentPath, original, "utf-8");
+				const settingsPath = path.join(root, ".pi", "settings.json");
+				fs.writeFileSync(settingsPath, JSON.stringify({
+					subagents: { agentOverrides: { "package-admin-agent": { thinking: "low" } } },
+				}, null, 2), "utf-8");
+
+				const sent: unknown[] = [];
+				const commands = registerAdmin(sent);
+				await commands.get("subagents")!.handler("package-admin-agent model", createCommandContext({
+					cwd: root,
+					hasUI: true,
+					modelRegistry: { getAvailable: () => [{ provider: "test", id: "replacement", reasoning: true }] },
+					select: async () => "test/replacement",
+				}));
+				await commands.get("subagents")!.handler("package-admin-agent prompt", createCommandContext({
+					cwd: root,
+					hasUI: true,
+				}));
+
+				assert.equal(fs.readFileSync(agentPath, "utf-8"), original);
+				assert.deepEqual(JSON.parse(fs.readFileSync(settingsPath, "utf-8")).subagents.agentOverrides, {
+					"package-admin-agent": { thinking: "low" },
+				});
+				assert.match((sent[0] as { content?: string }).content ?? "", /model.*read-only package definition/);
+				assert.match((sent[1] as { content?: string }).content ?? "", /systemPrompt.*read-only package definition/);
+
+				const configurablePath = path.join(packageRoot, "agents", "configurable-package-agent.md");
+				const configurable = "---\nname: configurable-package-agent\ndescription: Configurable package agent\n---\n\nPackage prompt.\n";
+				fs.writeFileSync(configurablePath, configurable, "utf-8");
+				await commands.get("subagents")!.handler("configurable-package-agent model", createCommandContext({
+					cwd: root,
+					hasUI: true,
+					modelRegistry: { getAvailable: () => [{ provider: "test", id: "replacement", reasoning: true }] },
+					select: async (title) => title.startsWith("Select model") ? "test/replacement" : "project",
+				}));
+				assert.equal(fs.readFileSync(configurablePath, "utf-8"), configurable);
+				assert.deepEqual(JSON.parse(fs.readFileSync(settingsPath, "utf-8")).subagents.agentOverrides, {
+					"package-admin-agent": { thinking: "low" },
+					"configurable-package-agent": { model: "test/replacement" },
+				});
+			});
+		});
+	});
+
+	it("round-trips a system prompt through a quoted external editor command", async () => {
+		await withIsolatedHome(async () => {
+			await withTempProject("pi-subagents-admin-prompt-", async (root) => {
 			const agentPath = path.join(root, ".pi", "agents", "worker.md");
 			fs.writeFileSync(agentPath, `---\nname: worker\ndescription: Test worker\n---\n\nOriginal prompt.\n`, "utf-8");
-			const editorPath = path.join(root, "edit-prompt.cjs");
+			const editorDir = path.join(root, "editor fixtures");
+			const editorPath = path.join(editorDir, "edit prompt.cjs");
+			fs.mkdirSync(editorDir, { recursive: true });
 			fs.writeFileSync(editorPath, `const fs = require("node:fs");\nfs.appendFileSync(process.argv[2], "\\nEdited by test.");\n`);
 			const previousEditor = process.env.EDITOR;
 			const previousVisual = process.env.VISUAL;
-			process.env.EDITOR = `${process.execPath} ${editorPath}`;
+			process.env.EDITOR = `"${process.execPath}" "${editorPath}"`;
 			delete process.env.VISUAL;
 			try {
 				const commands = registerAdmin([]);
@@ -1406,17 +1908,121 @@ describe("subagents admin slash command", { skip: !available ? "slash-commands.t
 				if (previousEditor === undefined) delete process.env.EDITOR; else process.env.EDITOR = previousEditor;
 				if (previousVisual === undefined) delete process.env.VISUAL; else process.env.VISUAL = previousVisual;
 			}
+			});
+		});
+	});
+
+	it("launches a quoted Windows .cmd editor", { skip: process.platform !== "win32" }, async () => {
+		await withIsolatedHome(async () => {
+			await withTempProject("pi-subagents-admin-cmd-editor-", async (root) => {
+				const agentPath = path.join(root, ".pi", "agents", "worker.md");
+				fs.writeFileSync(agentPath, "---\nname: worker\ndescription: Test worker\n---\n\nOriginal prompt.\n", "utf-8");
+				const editorDir = path.join(root, "editor fixtures");
+				const editorPath = path.join(editorDir, "edit prompt.cmd");
+				fs.mkdirSync(editorDir, { recursive: true });
+				fs.writeFileSync(editorPath, "@echo off\r\n>>\"%~1\" echo(\r\n>>\"%~1\" echo Edited by cmd.\r\n", "utf-8");
+				const previousEditor = process.env.EDITOR;
+				const previousVisual = process.env.VISUAL;
+				process.env.EDITOR = `"${editorPath}"`;
+				delete process.env.VISUAL;
+				try {
+					const commands = registerAdmin([]);
+					await commands.get("subagents")!.handler("worker prompt", createCommandContext({
+						cwd: root,
+						hasUI: true,
+						select: async (_title, choices) => choices.find((choice) => choice.startsWith("worker [project]")),
+					}));
+					assert.match(fs.readFileSync(agentPath, "utf-8"), /Original prompt\.\r?\nEdited by cmd\./);
+				} finally {
+					if (previousEditor === undefined) delete process.env.EDITOR; else process.env.EDITOR = previousEditor;
+					if (previousVisual === undefined) delete process.env.VISUAL; else process.env.VISUAL = previousVisual;
+				}
+			});
+		});
+	});
+
+	it("resolves a bare Windows .bat editor and preserves editor arguments", { skip: process.platform !== "win32" }, async () => {
+		await withIsolatedHome(async () => {
+			await withTempProject("pi-subagents-admin-bare-editor-", async (root) => {
+				const agentPath = path.join(root, ".pi", "agents", "worker.md");
+				fs.writeFileSync(agentPath, "---\nname: worker\ndescription: Test worker\n---\n\nOriginal prompt.\n", "utf-8");
+				const editorDir = path.join(root, "editor-bin");
+				fs.mkdirSync(editorDir, { recursive: true });
+				fs.writeFileSync(path.join(editorDir, "bare-editor.bat"), [
+					"@echo off",
+					"if not \"%~1\"==\"--append\" exit /b 9",
+					">>\"%~2\" echo(",
+					">>\"%~2\" echo Edited by bare bat.",
+					"",
+				].join("\r\n"), "utf-8");
+				const previousEditor = process.env.EDITOR;
+				const previousVisual = process.env.VISUAL;
+				const previousPath = process.env.PATH;
+				const previousPathExt = process.env.PATHEXT;
+				process.env.EDITOR = "bare-editor --append";
+				delete process.env.VISUAL;
+				process.env.PATH = `${editorDir}${path.delimiter}${previousPath ?? ""}`;
+				process.env.PATHEXT = previousPathExt || ".COM;.EXE;.BAT;.CMD";
+				try {
+					const commands = registerAdmin([]);
+					await commands.get("subagents")!.handler("worker prompt", createCommandContext({
+						cwd: root,
+						hasUI: true,
+						select: async (_title, choices) => choices.find((choice) => choice.startsWith("worker [project]")),
+					}));
+					assert.match(fs.readFileSync(agentPath, "utf-8"), /Original prompt\.\r?\nEdited by bare bat\./);
+				} finally {
+					if (previousEditor === undefined) delete process.env.EDITOR; else process.env.EDITOR = previousEditor;
+					if (previousVisual === undefined) delete process.env.VISUAL; else process.env.VISUAL = previousVisual;
+					if (previousPath === undefined) delete process.env.PATH; else process.env.PATH = previousPath;
+					if (previousPathExt === undefined) delete process.env.PATHEXT; else process.env.PATHEXT = previousPathExt;
+				}
+			});
+		});
+	});
+
+	it("reports a nonzero external editor exit without rewriting the agent", async () => {
+		await withIsolatedHome(async () => {
+			await withTempProject("pi-subagents-admin-editor-failure-", async (root) => {
+				const agentPath = path.join(root, ".pi", "agents", "worker.md");
+				const original = `---\nname: worker\ndescription: Test worker\n---\n\nOriginal prompt.\n`;
+				fs.writeFileSync(agentPath, original, "utf-8");
+				const editorPath = path.join(root, "failed-editor.cjs");
+				fs.writeFileSync(editorPath, "process.exitCode = 7;\n", "utf-8");
+				const previousEditor = process.env.EDITOR;
+				const previousVisual = process.env.VISUAL;
+				process.env.EDITOR = `${process.execPath} ${editorPath}`;
+				delete process.env.VISUAL;
+				try {
+					const sent: unknown[] = [];
+					const commands = registerAdmin(sent);
+					await commands.get("subagents")!.handler("worker prompt", createCommandContext({
+						cwd: root,
+						hasUI: true,
+						select: async (_title, choices) => choices.find((choice) => choice.startsWith("worker [project]")),
+					}));
+					assert.equal(fs.readFileSync(agentPath, "utf-8"), original);
+					assert.match((sent.at(-1) as { content?: string }).content ?? "", /Failed to update 'worker'.*exited with code 7/);
+				} finally {
+					if (previousEditor === undefined) delete process.env.EDITOR; else process.env.EDITOR = previousEditor;
+					if (previousVisual === undefined) delete process.env.VISUAL; else process.env.VISUAL = previousVisual;
+				}
+			});
 		});
 	});
 
 	it("shows metadata for a named subagent without requiring UI", async () => {
-		await withTempProject("pi-subagents-admin-metadata-", async (root) => {
-			fs.writeFileSync(path.join(root, ".pi", "agents", "auditor.md"), `---\nname: auditor\ndescription: Audit things\n---\n\nAudit.\n`, "utf-8");
+		await withIsolatedHome(async () => {
+			await withTempProject("pi-subagents-admin-metadata-", async (root) => {
+			fs.writeFileSync(path.join(root, ".pi", "agents", "auditor.md"), `---\nname: auditor\ndescription: Audit things\nthinking: false\n---\n\nAudit.\n`, "utf-8");
 			const sent: unknown[] = [];
 			const commands = registerAdmin(sent);
 			await commands.get("subagents")!.handler("auditor", createCommandContext({ cwd: root }));
 			assert.equal(sent.length, 1);
-			assert.match((sent[0] as { content?: string }).content ?? "", /Agent: auditor \(project\)/);
+			const content = (sent[0] as { content?: string }).content ?? "";
+			assert.match(content, /Agent: auditor \(project\)/);
+			assert.match(content, /^Thinking: off$/m);
+			});
 		});
 	});
 });
@@ -1432,9 +2038,235 @@ describe("subagents-doctor slash command", { skip: !available ? "slash-commands.
 		assert.deepEqual(params, { action: "doctor" });
 	});
 
-	it("routes fleet to the read-only status view", async () => {
+	it("keeps the textual fleet status fallback when no UI is available", async () => {
 		const { params } = await captureSlashCommandParams("subagents-fleet", "", process.cwd());
 		assert.deepEqual(params, { action: "status", view: "fleet" });
+	});
+
+	it("opens the native fleet from both the slash command and direct shortcut", async () => {
+		const commands = new Map<string, RegisteredSlashCommand>();
+		const shortcuts = new Map<string, { description: string; handler(ctx: unknown): Promise<void> }>();
+		let opened = 0;
+		let rendered = "";
+		const custom = async (factory: unknown, options: unknown) => {
+			opened++;
+			const component = (factory as (tui: unknown, theme: unknown, keybindings: unknown, done: (value: undefined) => void) => { render(width: number): string[]; dispose(): void })(
+				{ terminal: { rows: 30, columns: 100 }, requestRender() {} },
+				{ fg: (_name: string, text: string) => text, bold: (text: string) => text },
+				undefined,
+				() => {},
+			);
+			rendered = component.render(100).join("\n");
+			component.dispose();
+			assert.deepEqual(options, { overlay: true, overlayOptions: { anchor: "center", width: "95%", minWidth: 60, maxHeight: "85%", margin: 1 } });
+			return undefined;
+		};
+		const pi = {
+			events: createEventBus(),
+			registerCommand(name: string, spec: RegisteredSlashCommand) { commands.set(name, spec); },
+			registerShortcut(key: string, spec: { description: string; handler(ctx: unknown): Promise<void> }) { shortcuts.set(key, spec); },
+			sendMessage(_message: unknown) {},
+		};
+		const state = createState(process.cwd());
+		const ctx = createCommandContext({ hasUI: true, custom });
+		registerSlashCommands!(pi, state);
+
+		await commands.get("subagents-fleet")!.handler("", ctx);
+		assert.equal(shortcuts.size, 1);
+		const shortcut = [...shortcuts.values()][0]!;
+		assert.equal(shortcut.description, "Open subagent fleet inspector");
+		await shortcut.handler(ctx);
+
+		assert.equal(opened, 2);
+		assert.match(rendered, /Subagent fleet/);
+		assert.match(rendered, /inspection only/);
+	});
+
+	it("routes subagents-stop with an id directly to the stop action", async () => {
+		const { params } = await captureSlashCommandParams("subagents-stop", "run-123", process.cwd());
+		assert.deepEqual(params, { action: "stop", id: "run-123" });
+	});
+
+	it("prints exact stop commands when subagents-stop has no UI", async () => {
+		await withIsolatedHome(async () => {
+			const runId = `slash-stop-${Date.now().toString(36)}`;
+			const asyncDir = path.join(ASYNC_DIR, runId);
+			fs.mkdirSync(asyncDir, { recursive: true });
+			fs.writeFileSync(path.join(asyncDir, "status.json"), JSON.stringify({
+				runId,
+				sessionId: "session-test",
+				mode: "single",
+				state: "running",
+				pid: process.pid,
+				startedAt: Date.now(),
+				lastUpdate: Date.now(),
+				steps: [{ agent: "worker", status: "running", startedAt: Date.now() }],
+			}, null, 2));
+			try {
+				const sent: unknown[] = [];
+				const commands = new Map<string, RegisteredSlashCommand>();
+				const pi = {
+					events: createEventBus(),
+					registerCommand(name: string, spec: RegisteredSlashCommand) { commands.set(name, spec); },
+					registerShortcut() {},
+					sendMessage(message: unknown) { sent.push(message); },
+				};
+				const state = createState(process.cwd());
+				state.currentSessionId = "session-test";
+				registerSlashCommands!(pi, state);
+				await commands.get("subagents-stop")!.handler("", createCommandContext({ hasUI: false }));
+
+				const content = String((sent[0] as { content?: unknown }).content ?? "");
+				assert.match(content, new RegExp(`subagent\\({ action: "stop", id: "${runId}" }\\)`));
+				assert.match(content, new RegExp(`/subagents-stop ${runId}`));
+			} finally {
+				fs.rmSync(asyncDir, { recursive: true, force: true });
+			}
+		});
+	});
+
+	it("prints cancel commands for scheduled subagent runs when subagents-stop has no UI", async () => {
+		await withIsolatedHome(async () => {
+			await withTempProject("pi-slash-stop-scheduled-", async (root) => {
+				const storePath = scheduledRunStorePath(root, "session-test");
+				fs.mkdirSync(path.dirname(storePath), { recursive: true });
+				fs.writeFileSync(storePath, JSON.stringify({
+					version: 1,
+					cwd: root,
+					sessionId: "session-test",
+					jobs: [{
+						id: "job-1",
+						name: "nightly scout",
+						schedule: "+10m",
+						runAt: Date.now() + 600_000,
+						state: "scheduled",
+						createdAt: Date.now(),
+						updatedAt: Date.now(),
+						cwd: root,
+						sessionId: "session-test",
+						params: { agent: "scout", task: "later", async: true },
+					}],
+				}, null, 2));
+				const sent: unknown[] = [];
+				const commands = new Map<string, RegisteredSlashCommand>();
+				const state = createState(root);
+				state.currentSessionId = "session-test";
+				const pi = {
+					events: createEventBus(),
+					registerCommand(name: string, spec: RegisteredSlashCommand) { commands.set(name, spec); },
+					registerShortcut() {},
+					sendMessage(message: unknown) { sent.push(message); },
+				};
+				registerSlashCommands!(pi, state);
+				await commands.get("subagents-stop")!.handler("", createCommandContext({ cwd: root, hasUI: false }));
+
+				const content = String((sent[0] as { content?: unknown }).content ?? "");
+				assert.match(content, /job-1 · nightly scout/);
+				assert.match(content, /cancel scheduled run: subagent\({ action: "schedule-cancel", id: "job-1" }\)/);
+				assert.doesNotMatch(content, /\/subagents-stop job-1/);
+			});
+		});
+	});
+
+	it("routes selected scheduled subagents-stop targets through schedule-cancel", async () => {
+		await withIsolatedHome(async () => {
+			await withTempProject("pi-slash-stop-selected-scheduled-", async (root) => {
+				const storePath = scheduledRunStorePath(root, "session-test");
+				fs.mkdirSync(path.dirname(storePath), { recursive: true });
+				fs.writeFileSync(storePath, JSON.stringify({
+					version: 1,
+					cwd: root,
+					sessionId: "session-test",
+					jobs: [{
+						id: "job-2",
+						name: "delayed worker",
+						schedule: "+10m",
+						runAt: Date.now() + 600_000,
+						state: "scheduled",
+						createdAt: Date.now(),
+						updatedAt: Date.now(),
+						cwd: root,
+						sessionId: "session-test",
+						params: { agent: "worker", task: "later", async: true },
+					}],
+				}, null, 2));
+
+				const commands = new Map<string, RegisteredSlashCommand>();
+				const events = createEventBus();
+				let requestedParams: unknown;
+				events.on(SLASH_SUBAGENT_REQUEST_EVENT, (data) => {
+					const payload = data as { requestId: string; params?: unknown };
+					requestedParams = payload.params;
+					events.emit(SLASH_SUBAGENT_STARTED_EVENT, { requestId: payload.requestId });
+					events.emit(SLASH_SUBAGENT_RESPONSE_EVENT, {
+						requestId: payload.requestId,
+						result: { content: [{ type: "text", text: "cancelled" }], details: { mode: "management", results: [] } },
+						isError: false,
+					});
+				});
+				const state = createState(root);
+				state.currentSessionId = "session-test";
+				const pi = {
+					events,
+					registerCommand(name: string, spec: RegisteredSlashCommand) { commands.set(name, spec); },
+					registerShortcut() {},
+					sendMessage(_message: unknown) {},
+				};
+				registerSlashCommands!(pi, state);
+				await commands.get("subagents-stop")!.handler("", createCommandContext({
+					cwd: root,
+					hasUI: true,
+					custom: async () => ({
+						confirmed: true,
+						target: { kind: "scheduled", id: "job-2", label: "job-2", detail: "scheduled", actionLabel: "cancel scheduled run" },
+					}),
+				}));
+
+				assert.deepEqual(requestedParams, { action: "schedule-cancel", id: "job-2" });
+			});
+		});
+	});
+
+	it("prints fallback text instead of opening or enumerating the selector in child-safe fanout mode", async () => {
+		await withIsolatedHome(async () => {
+			const previous = process.env[SUBAGENT_FANOUT_CHILD_ENV];
+			const runId = `slash-stop-child-safe-${Date.now().toString(36)}`;
+			const asyncDir = path.join(ASYNC_DIR, runId);
+			process.env[SUBAGENT_FANOUT_CHILD_ENV] = "1";
+			fs.mkdirSync(asyncDir, { recursive: true });
+			fs.writeFileSync(path.join(asyncDir, "status.json"), JSON.stringify({
+				runId,
+				sessionId: "session-test",
+				mode: "single",
+				state: "running",
+				pid: process.pid,
+				startedAt: Date.now(),
+				lastUpdate: Date.now(),
+				steps: [{ agent: "worker", status: "running", startedAt: Date.now() }],
+			}, null, 2));
+			try {
+				const sent: unknown[] = [];
+				const commands = new Map<string, RegisteredSlashCommand>();
+				const pi = {
+					events: createEventBus(),
+					registerCommand(name: string, spec: RegisteredSlashCommand) { commands.set(name, spec); },
+					registerShortcut() {},
+					sendMessage(message: unknown) { sent.push(message); },
+				};
+				const state = createState(process.cwd());
+				state.currentSessionId = "session-test";
+				registerSlashCommands!(pi, state);
+				await commands.get("subagents-stop")!.handler("", createCommandContext({ hasUI: true }));
+
+				const content = String((sent[0] as { content?: unknown }).content ?? "");
+				assert.match(content, /Selector unavailable in child-safe fanout mode\./);
+				assert.doesNotMatch(content, new RegExp(runId));
+			} finally {
+				fs.rmSync(asyncDir, { recursive: true, force: true });
+				if (previous === undefined) delete process.env[SUBAGENT_FANOUT_CHILD_ENV];
+				else process.env[SUBAGENT_FANOUT_CHILD_ENV] = previous;
+			}
+		});
 	});
 
 	it("does not register the removed subagents-status overlay command", async () => {

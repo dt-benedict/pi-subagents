@@ -7,6 +7,7 @@ import { handleManagementAction } from "../../src/agents/agent-management.ts";
 import { serializeAgent } from "../../src/agents/agent-serializer.ts";
 import { parseChain, serializeChain } from "../../src/agents/chain-serializer.ts";
 import { discoverAgents, discoverAgentsAll, type AgentConfig } from "../../src/agents/agents.ts";
+import { parseFrontmatter } from "../../src/agents/frontmatter.ts";
 import { buildPiArgs } from "../../src/runs/shared/pi-args.ts";
 import { THINKING_LEVELS } from "../../src/shared/model-info.ts";
 
@@ -53,6 +54,177 @@ afterEach(() => {
 		if (!dir) continue;
 		fs.rmSync(dir, { recursive: true, force: true });
 	}
+});
+
+describe("folded frontmatter blocks", () => {
+	it("folds ordinary lines and paragraph breaks for > and >-", () => {
+		const expected = "first line second line\nthird line";
+		const folded = parseFrontmatter(`---
+name: worker
+description: >
+  first line
+  second line
+
+  third line
+---
+body`);
+		const stripped = parseFrontmatter(`---
+name: worker
+description: >-
+  first line
+  second line
+
+  third line
+---
+body`);
+
+		assert.equal(folded.frontmatter.description, expected);
+		assert.equal(stripped.frontmatter.description, expected);
+		assert.equal(folded.frontmatter.name, "worker");
+	});
+
+	it("keeps quoted indicators as literal values", () => {
+		const parsed = parseFrontmatter(`---
+description: ">"
+other: '>-'
+---
+body`);
+
+		assert.equal(parsed.frontmatter.description, ">");
+		assert.equal(parsed.frontmatter.other, ">-");
+	});
+
+	it("preserves more-indented lines and repeated whitespace-only separators", () => {
+		const parsed = parseFrontmatter(`---
+description: >
+  normal
+    code
+  next
+
+  first
+
+  ${" ".repeat(3)}
+  second
+name: worker
+---
+body`);
+
+		assert.equal(parsed.frontmatter.description, "normal\n  code\nnext\nfirst\n\nsecond");
+		assert.equal(parsed.frontmatter.name, "worker");
+	});
+
+	it("keeps paragraph breaks adjacent to more-indented lines", () => {
+		const afterIndented = parseFrontmatter(`---
+description: >
+  normal
+    code
+
+  next
+---
+body`);
+		const beforeIndented = parseFrontmatter(`---
+description: >
+  normal
+
+    code
+  next
+---
+body`);
+
+		assert.equal(afterIndented.frontmatter.description, "normal\n  code\n\nnext");
+		assert.equal(beforeIndented.frontmatter.description, "normal\n\n  code\nnext");
+	});
+});
+
+describe("agent skillPath frontmatter", () => {
+	it("parses and serializes comma-separated paths", () => withTempHome(() => {
+		const project = fs.mkdtempSync(path.join(os.tmpdir(), "pi-subagents-skill-path-agent-"));
+		tempDirs.push(project);
+		writeAgent(path.join(project, ".pi", "agents", "worker.md"), `---
+name: worker
+description: Worker
+skillPath: ./skills, ../shared-skills
+---
+body`);
+
+		const worker = discoverAgents(project, "both").agents.find((agent) => agent.name === "worker")!;
+		assert.deepEqual(worker.skillPath, ["./skills", "../shared-skills"]);
+		assert.match(serializeAgent(worker), /^skillPath: \.\/skills, \.\.\/shared-skills$/m);
+	}));
+});
+
+describe("agent simple-scalar list frontmatter", () => {
+	it("discovers newline block lists for all list fields and routes MCP tools", () => {
+		const dir = fs.mkdtempSync(path.join(os.tmpdir(), "pi-subagents-agent-block-list-frontmatter-"));
+		tempDirs.push(dir);
+		writeAgent(path.join(dir, ".pi", "agents", "worker.md"), `---
+name: worker
+description: Worker
+tools:
+  - read-only
+  - mcp:github/search_repositories
+defaultReads:
+  - input-one.md
+  - input-two.md
+skill:
+  - review-checklist
+  - safe-bash
+skillPath:
+  - ./private-skills
+  - ../shared-skills
+fallbackModels:
+  - openai/gpt-5-mini
+  - anthropic/claude-sonnet-4
+extensions:
+  - ./extension-one.ts
+  - ./extension-two.ts
+subagentOnlyExtensions:
+  - ./child-only.ts
+  - ./child-helper.ts
+---
+
+Do work
+`);
+
+		const worker = discoverAgents(dir, "project").agents.find((agent) => agent.name === "worker");
+		assert.deepEqual(worker?.tools, ["read-only"]);
+		assert.deepEqual(worker?.mcpDirectTools, ["github/search_repositories"]);
+		assert.deepEqual(worker?.defaultReads, ["input-one.md", "input-two.md"]);
+		assert.deepEqual(worker?.skills, ["review-checklist", "safe-bash"]);
+		assert.deepEqual(worker?.skillPath, ["./private-skills", "../shared-skills"]);
+		assert.deepEqual(worker?.fallbackModels, ["openai/gpt-5-mini", "anthropic/claude-sonnet-4"]);
+		assert.deepEqual(worker?.extensions, ["./extension-one.ts", "./extension-two.ts"]);
+		assert.deepEqual(worker?.subagentOnlyExtensions, ["./child-only.ts", "./child-helper.ts"]);
+	});
+
+	it("preserves comma-separated syntax across all list fields", () => {
+		const dir = fs.mkdtempSync(path.join(os.tmpdir(), "pi-subagents-agent-comma-list-frontmatter-"));
+		tempDirs.push(dir);
+		writeAgent(path.join(dir, ".pi", "agents", "worker.md"), `---
+name: worker
+description: Worker
+tools: read-only, mcp:github/search_repositories
+defaultReads: input-one.md, input-two.md
+skills: review-checklist, safe-bash
+skillPath: ./private-skills, ../shared-skills
+fallbackModels: openai/gpt-5-mini, anthropic/claude-sonnet-4
+extensions: ./extension-one.ts, ./extension-two.ts
+subagentOnlyExtensions: ./child-only.ts, ./child-helper.ts
+---
+
+Do work
+`);
+
+		const worker = discoverAgents(dir, "project").agents.find((agent) => agent.name === "worker");
+		assert.deepEqual(worker?.tools, ["read-only"]);
+		assert.deepEqual(worker?.mcpDirectTools, ["github/search_repositories"]);
+		assert.deepEqual(worker?.defaultReads, ["input-one.md", "input-two.md"]);
+		assert.deepEqual(worker?.skills, ["review-checklist", "safe-bash"]);
+		assert.deepEqual(worker?.skillPath, ["./private-skills", "../shared-skills"]);
+		assert.deepEqual(worker?.fallbackModels, ["openai/gpt-5-mini", "anthropic/claude-sonnet-4"]);
+		assert.deepEqual(worker?.extensions, ["./extension-one.ts", "./extension-two.ts"]);
+		assert.deepEqual(worker?.subagentOnlyExtensions, ["./child-only.ts", "./child-helper.ts"]);
+	});
 });
 
 describe("agent permission frontmatter", () => {
@@ -135,6 +307,132 @@ Do work
 			const agent = agents.find((candidate) => candidate.name === name);
 			assert.equal(agent?.defaultContext, "fork", `${name} should default to fork context`);
 		}
+	});
+});
+
+describe("agent frontmatter launch defaults", () => {
+	it("serializes and discovers single-agent launch defaults", () => {
+		const dir = fs.mkdtempSync(path.join(os.tmpdir(), "pi-subagents-agent-launch-defaults-"));
+		tempDirs.push(dir);
+		const filePath = path.join(dir, ".pi", "agents", "worker.md");
+		const agent: AgentConfig = {
+			name: "worker",
+			description: "Worker",
+			systemPrompt: "Do work",
+			systemPromptMode: "replace",
+			inheritProjectContext: false,
+			inheritSkills: false,
+			source: "project",
+			filePath,
+			defaultAsync: false,
+			defaultTimeoutMs: 90_000,
+			defaultTurnBudget: { maxTurns: 12, graceTurns: 2 },
+			defaultAcceptance: { level: "none", reason: "lightweight lookup" },
+		};
+
+		const serialized = serializeAgent(agent);
+		assert.match(serialized, /^async: false$/m);
+		assert.match(serialized, /^timeoutMs: 90000$/m);
+		assert.match(serialized, /^turnBudget: \{"maxTurns":12,"graceTurns":2\}$/m);
+		assert.match(serialized, /^acceptance: \{"level":"none","reason":"lightweight lookup"\}$/m);
+		writeAgent(filePath, serialized);
+
+		const worker = discoverAgents(dir, "project").agents.find((candidate) => candidate.name === "worker");
+		assert.equal(worker?.defaultAsync, false);
+		assert.equal(worker?.defaultTimeoutMs, 90_000);
+		assert.deepEqual(worker?.defaultTurnBudget, { maxTurns: 12, graceTurns: 2 });
+		assert.deepEqual(worker?.defaultAcceptance, { level: "none", reason: "lightweight lookup" });
+	});
+
+	it("parses scalar acceptance defaults and rejects invalid policies", () => {
+		const dir = fs.mkdtempSync(path.join(os.tmpdir(), "pi-subagents-agent-acceptance-defaults-"));
+		tempDirs.push(dir);
+		const filePath = path.join(dir, ".pi", "agents", "worker.md");
+		writeAgent(filePath, `---
+name: worker
+description: Worker
+acceptance: checked
+---
+
+Do work
+`);
+		assert.equal(discoverAgents(dir, "project").agents.find((agent) => agent.name === "worker")?.defaultAcceptance, "checked");
+
+		writeAgent(filePath, `---
+name: worker
+description: Worker
+acceptance: { level: "none", reason: "NA" }
+---
+
+Do work
+`);
+		assert.deepEqual(
+			discoverAgents(dir, "project").agents.find((agent) => agent.name === "worker")?.defaultAcceptance,
+			{ level: "none", reason: "NA" },
+		);
+
+		writeAgent(filePath, `---
+name: worker
+description: Worker
+acceptance: none
+---
+
+Do work
+`);
+		assert.throws(
+			() => discoverAgents(dir, "project"),
+			/Agent 'worker' acceptance frontmatter level "none" requires a reason/,
+		);
+	});
+
+	it("parses, serializes, and validates acceptance roles", () => {
+		const dir = fs.mkdtempSync(path.join(os.tmpdir(), "pi-subagents-agent-acceptance-role-"));
+		tempDirs.push(dir);
+		const filePath = path.join(dir, ".pi", "agents", "explorer.md");
+		writeAgent(filePath, `---
+name: explorer
+description: Explorer
+acceptanceRole: read-only
+---
+
+Explore the codebase
+`);
+
+		const explorer = discoverAgents(dir, "project").agents.find((agent) => agent.name === "explorer");
+		assert.equal(explorer?.acceptanceRole, "read-only");
+		assert.match(serializeAgent(explorer!), /^acceptanceRole: read-only$/m);
+		assert.equal(explorer?.extraFields?.acceptanceRole, undefined);
+
+		writeAgent(filePath, `---
+name: explorer
+description: Explorer
+acceptanceRole: observer
+---
+
+Explore the codebase
+`);
+		assert.throws(
+			() => discoverAgents(dir, "project"),
+			/Agent 'explorer' has invalid acceptanceRole frontmatter; expected 'read-only' or 'writer'/,
+		);
+	});
+
+	it("rejects invalid launch defaults instead of silently ignoring them", () => {
+		const dir = fs.mkdtempSync(path.join(os.tmpdir(), "pi-subagents-agent-invalid-launch-defaults-"));
+		tempDirs.push(dir);
+		writeAgent(path.join(dir, ".pi", "agents", "worker.md"), `---
+name: worker
+description: Worker
+async: sometimes
+---
+
+Do work
+`);
+
+		assert.throws(
+			() => discoverAgents(dir, "project"),
+			/Agent 'worker' has invalid async frontmatter; expected true or false/,
+		);
 	});
 });
 

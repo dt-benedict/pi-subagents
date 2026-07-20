@@ -10,6 +10,7 @@ import { fileURLToPath } from "node:url";
 import { createRequire } from "node:module";
 import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
 import type { AgentConfig } from "../../agents/agents.ts";
+import { writePrivateAtomicJson } from "../../shared/atomic-json.ts";
 import { applyThinkingSuffix } from "../shared/pi-args.ts";
 import { injectOutputPathSystemPrompt, injectSingleOutputInstruction, normalizeSingleOutputOverride, resolveSingleOutputPath, validateFileOnlyOutputMode } from "../shared/single-output.ts";
 import { buildChainInstructions, isDynamicParallelStep, isParallelStep, resolveStepBehavior, suppressProgressForReadOnlyTask, writeInitialProgressFile, type ChainStep, type ResolvedStepBehavior, type SequentialStep, type StepOverrides } from "../../shared/settings.ts";
@@ -18,7 +19,7 @@ import { resolvePiPackageRoot } from "../shared/pi-spawn.ts";
 import { buildSkillInjection, normalizeSkillInput, resolveSkillsWithFallback } from "../../agents/skills.ts";
 import { buildAgentMemoryInjection } from "../../agents/agent-memory.ts";
 import { PI_CODING_AGENT_PACKAGE_ROOT_ENV, resolveChildCwd } from "../../shared/utils.ts";
-import { buildModelCandidates, resolveModelCandidate, resolveSubagentModelOverride, type AvailableModelInfo, type ParentModel } from "../shared/model-fallback.ts";
+import { buildModelCandidates, resolveEffectiveSubagentModel, resolveModelCandidate, resolveSubagentModelOverride, type AvailableModelInfo, type ParentModel } from "../shared/model-fallback.ts";
 import type { ModelScopeConfig } from "../shared/model-scope.ts";
 import { resolveEffectiveThinking } from "../../shared/model-info.ts";
 import { resolveExpectedWorktreeAgentCwd } from "../shared/worktree.ts";
@@ -36,6 +37,7 @@ import {
 	type ResolvedTurnBudget,
 	type ResolvedToolBudget,
 	type SubagentRunMode,
+	type SteeringRecoveryDescriptor,
 	ASYNC_DIR,
 	RESULTS_DIR,
 	SUBAGENT_ASYNC_STARTED_EVENT,
@@ -48,6 +50,7 @@ import { nestedResultsPath, resolveInheritedNestedRouteFromEnv, resolveNestedPar
 import { initialTurnBudgetState } from "../shared/turn-budget.ts";
 import { validateToolBudgetConfig } from "../shared/tool-budget.ts";
 import type { ImportedAsyncRoot } from "./chain-root-attachment.ts";
+import type { SessionLeaseRequest } from "../shared/session-lease.ts";
 
 const require = createRequire(import.meta.url);
 const piPackageRoot = resolvePiPackageRoot();
@@ -108,11 +111,15 @@ interface AsyncExecutionContext {
 	currentModel?: ParentModel;
 	/** Optional model-scope enforcement resolved from subagent settings. */
 	modelScope?: ModelScopeConfig;
+	/** Whether the parent session has an interactive UI. */
+	interactive?: boolean;
 }
 
 interface AsyncChainParams {
 	chain: ChainStep[];
 	task?: string;
+	/** Raw caller-facing goal used only by the started event. */
+	goal?: string;
 	attachRoot?: ImportedAsyncRoot & { agent: string; outputName?: string; label?: string };
 	resultMode?: Exclude<SubagentRunMode, "single">;
 	agents: AgentConfig[];
@@ -130,6 +137,7 @@ interface AsyncChainParams {
 	progressDir?: string;
 	dynamicFanoutMaxItems?: number;
 	maxSubagentDepth: number;
+	waitToolEnabled?: boolean;
 	worktreeSetupHook?: string;
 	worktreeSetupHookTimeoutMs?: number;
 	worktreeBaseDir?: string;
@@ -149,6 +157,8 @@ interface AsyncChainParams {
 interface AsyncSingleParams {
 	agent: string;
 	task?: string;
+	/** Raw caller-facing goal used only by the started event. */
+	goal?: string;
 	agentConfig: AgentConfig;
 	ctx: AsyncExecutionContext;
 	cwd?: string;
@@ -157,7 +167,9 @@ interface AsyncSingleParams {
 	artifactConfig: ArtifactConfig;
 	shareEnabled: boolean;
 	sessionRoot?: string;
+	sessionDir?: string;
 	sessionFile?: string;
+	revivalLease?: SessionLeaseRequest;
 	skills?: string[];
 	output?: string | boolean;
 	outputMode?: "inline" | "file-only";
@@ -166,6 +178,7 @@ interface AsyncSingleParams {
 	thinkingOverride?: AgentConfig["thinking"];
 	availableModels?: AvailableModelInfo[];
 	maxSubagentDepth: number;
+	waitToolEnabled?: boolean;
 	worktreeSetupHook?: string;
 	worktreeSetupHookTimeoutMs?: number;
 	worktreeBaseDir?: string;
@@ -175,6 +188,7 @@ interface AsyncSingleParams {
 	nestedRoute?: NestedRouteInfo;
 	acceptance?: AcceptanceInput;
 	timeoutMs?: number;
+	absoluteDeadlineAt?: number;
 	turnBudget?: ResolvedTurnBudget;
 	toolBudget?: ResolvedToolBudget;
 	configToolBudget?: ResolvedToolBudget;
@@ -201,6 +215,7 @@ export interface AsyncRunnerStepBuildParams {
 	progressDir?: string;
 	dynamicFanoutMaxItems?: number;
 	maxSubagentDepth: number;
+	waitToolEnabled?: boolean;
 	worktreeBaseDir?: string;
 	asyncDir: string;
 	outputBaseDir?: string;
@@ -219,14 +234,20 @@ export type AsyncRunnerStepBuildResult =
 	}
 	| { error: string };
 
-export function formatAsyncStartedMessage(headline: string): string {
-	return [
-		headline,
-		"",
-		"The async run is detached. Do not run sleep timers or polling loops just to wait for it.",
-		"If you have independent work, continue that work. When you have nothing left to do until the async result arrives, call wait() — it blocks until the run finishes and delivers the completion here. Only if you are certain you will get another turn (an interactive session where the user will prompt you again) can you instead stop and let Pi wake you; inside a skill that must run to completion, or in a non-interactive run, there is no next turn, so use wait().",
-		"Use subagent({ action: \"status\", id: \"...\" }) when you need a one-shot status/result or to inspect a blocked/stale run. To block until completion, prefer wait(). Do not poll in a loop just to wait.",
-	].join("\n");
+export function formatAsyncStartedMessage(headline: string, interactive: boolean): string {
+	const guidance = interactive
+		? [
+			"The async run is detached and running in the background.",
+			"You are in an interactive session. By default, return control to the user now; Pi will wake you on completion when the run finishes or needs attention. Do NOT call subagent_wait() merely to wait, and do not run sleep/polling loops to wait for it.",
+			"Override that default and call subagent_wait() before ending the turn only when the current request is run-to-completion — for example, the user asked you to report results back here before continuing, or a skill must finish in one turn. In that case, call subagent_wait() to block until the run completes so its results are delivered in this turn instead of deferred.",
+			"Otherwise, continue any independent work or return control to the user. Use subagent({ action: \"status\", id: \"...\" }) for a one-shot status/result or to inspect a blocked/stale run, never as a wait loop.",
+		]
+		: [
+			"The async run is detached. Do not run sleep timers or polling loops just to wait for it.",
+			"This is a non-interactive run: Pi auto-drains current-session background work at agent_end so detached children are not abandoned; call subagent_wait() when this turn must receive the run's results before it ends, otherwise let the headless auto-drain finish the work.",
+			"Use subagent({ action: \"status\", id: \"...\" }) when you need a one-shot status/result or to inspect a blocked/stale run. To block until completion, use subagent_wait() — do not poll in a loop.",
+		];
+	return [headline, "", ...guidance].join("\n");
 }
 
 /**
@@ -280,6 +301,92 @@ function closeFd(fd: number | undefined): void {
 /**
  * Spawn the async runner process
  */
+const RUNNER_STARTUP_TIMEOUT_MS = 10_000;
+const RUNNER_STARTUP_WAIT_BUFFER = typeof SharedArrayBuffer !== "undefined" ? new SharedArrayBuffer(4) : undefined;
+const RUNNER_STARTUP_WAIT_VIEW = RUNNER_STARTUP_WAIT_BUFFER ? new Int32Array(RUNNER_STARTUP_WAIT_BUFFER) : undefined;
+
+type RunnerStartupState = "ready" | "acknowledged";
+
+type RunnerStartupWaitResult =
+	| { ok: true; token: string }
+	| { ok: false; error: string };
+
+function waitForStartupInterval(delayMs = 20): void {
+	if (RUNNER_STARTUP_WAIT_VIEW) {
+		Atomics.wait(RUNNER_STARTUP_WAIT_VIEW, 0, 0, delayMs);
+		return;
+	}
+	const waitUntil = Date.now() + delayMs;
+	while (Date.now() < waitUntil) {
+		// Startup handshakes are synchronous so resume rejects before reporting a run as started.
+	}
+}
+
+function readRunnerStartup(startupPath: string, expectedState: RunnerStartupState, expectedToken?: string): RunnerStartupWaitResult | undefined {
+	if (!fs.existsSync(startupPath)) return undefined;
+	try {
+		const payload = JSON.parse(fs.readFileSync(startupPath, "utf-8")) as { state?: unknown; token?: unknown; error?: unknown };
+		if (payload.state === "error" && typeof payload.error === "string") return { ok: false, error: payload.error };
+		if (payload.state !== expectedState) return undefined;
+		if (typeof payload.token !== "string" || (expectedToken !== undefined && payload.token !== expectedToken)) {
+			return { ok: false, error: `Async runner wrote an invalid ${expectedState} startup handshake: ${startupPath}` };
+		}
+		return { ok: true, token: payload.token };
+	} catch (error) {
+		return { ok: false, error: `Failed to read async runner startup handshake '${startupPath}': ${error instanceof Error ? error.message : String(error)}` };
+	}
+}
+
+function waitForRunnerStartup(startupPath: string, expectedState: RunnerStartupState, timeoutMs: number, expectedToken?: string): RunnerStartupWaitResult {
+	const deadline = Date.now() + timeoutMs;
+	for (;;) {
+		const result = readRunnerStartup(startupPath, expectedState, expectedToken);
+		if (result) return result;
+		if (Date.now() >= deadline) break;
+		waitForStartupInterval(Math.min(20, Math.max(1, deadline - Date.now())));
+	}
+	const finalResult = readRunnerStartup(startupPath, expectedState, expectedToken);
+	if (finalResult) return finalResult;
+	return { ok: false, error: `Timed out after ${timeoutMs}ms waiting for the async runner startup state '${expectedState}'.` };
+}
+
+function writeRunnerStartupControl(filePath: string, payload: { action: "ack" | "proceed"; token: string }): void {
+	const tempPath = `${filePath}.${process.pid}.${Date.now()}.${Math.random().toString(36).slice(2)}.tmp`;
+	try {
+		fs.writeFileSync(tempPath, JSON.stringify(payload), { encoding: "utf-8", mode: 0o600 });
+		fs.renameSync(tempPath, filePath);
+	} catch (error) {
+		try {
+			fs.rmSync(tempPath, { force: true });
+		} catch {
+			// Preserve the startup-control write error.
+		}
+		throw error;
+	}
+}
+
+function runnerIsAlive(pid: number): boolean {
+	try {
+		process.kill(pid, 0);
+		return true;
+	} catch (error) {
+		return (error as NodeJS.ErrnoException).code === "EPERM";
+	}
+}
+
+function terminateRunnerBeforeProceed(pid: number): void {
+	for (const signal of ["SIGTERM", "SIGKILL"] as const) {
+		if (!runnerIsAlive(pid)) return;
+		try {
+			process.kill(pid, signal);
+		} catch {
+			if (!runnerIsAlive(pid)) return;
+		}
+		const deadline = Date.now() + 1000;
+		while (runnerIsAlive(pid) && Date.now() < deadline) waitForStartupInterval();
+	}
+}
+
 function spawnRunner(cfg: object, suffix: string, cwd: string): { pid?: number; error?: string } {
 	if (!jitiCliPath) {
 		return { error: "upstream jiti for TypeScript execution could not be found; ensure package dependencies are installed" };
@@ -299,6 +406,15 @@ function spawnRunner(cfg: object, suffix: string, cwd: string): { pid?: number; 
 	fs.writeFileSync(cfgPath, JSON.stringify(cfg));
 	const runner = path.join(path.dirname(fileURLToPath(import.meta.url)), "subagent-runner.ts");
 	const nodeCommand = resolveAsyncRunnerNodeCommand();
+	const startupPath = typeof (cfg as { revivalLease?: unknown; asyncDir?: unknown }).revivalLease === "object"
+		&& typeof (cfg as { asyncDir?: unknown }).asyncDir === "string"
+		? path.join((cfg as { asyncDir: string }).asyncDir, "runner-startup.json")
+		: undefined;
+	const startupAckPath = startupPath ? path.join(path.dirname(startupPath), "runner-startup-ack.json") : undefined;
+	const startupProceedPath = startupPath ? path.join(path.dirname(startupPath), "runner-startup-proceed.json") : undefined;
+	if (startupPath) fs.rmSync(startupPath, { force: true });
+	if (startupAckPath) fs.rmSync(startupAckPath, { force: true });
+	if (startupProceedPath) fs.rmSync(startupProceedPath, { force: true });
 
 	const logPaths = resolveAsyncRunnerLogPaths(cfg);
 	let stdoutFd: number | undefined;
@@ -328,6 +444,35 @@ function spawnRunner(cfg: object, suffix: string, cwd: string): { pid?: number; 
 			return { error: `async runner did not produce a pid for cwd: ${cwd}` };
 		}
 		proc.unref();
+		if (startupPath && startupAckPath && startupProceedPath) {
+			const ready = waitForRunnerStartup(startupPath, "ready", RUNNER_STARTUP_TIMEOUT_MS);
+			if (!ready.ok) {
+				terminateRunnerBeforeProceed(proc.pid);
+				return { error: ready.error };
+			}
+			try {
+				writeRunnerStartupControl(startupAckPath, { action: "ack", token: ready.token });
+			} catch (error) {
+				terminateRunnerBeforeProceed(proc.pid);
+				return { error: `Failed to acknowledge async runner startup: ${error instanceof Error ? error.message : String(error)}` };
+			}
+			const acknowledged = waitForRunnerStartup(startupPath, "acknowledged", RUNNER_STARTUP_TIMEOUT_MS, ready.token);
+			if (!acknowledged.ok) {
+				terminateRunnerBeforeProceed(proc.pid);
+				return { error: acknowledged.error };
+			}
+			try {
+				writeRunnerStartupControl(startupProceedPath, { action: "proceed", token: ready.token });
+			} catch (error) {
+				terminateRunnerBeforeProceed(proc.pid);
+				return { error: `Failed to authorize async runner startup: ${error instanceof Error ? error.message : String(error)}` };
+			}
+			try {
+				fs.rmSync(startupPath, { force: true });
+			} catch {
+				// Proceed is the commit point; handshake cleanup cannot turn a running revival into a start error.
+			}
+		}
 		return { pid: proc.pid };
 	} catch (error) {
 		closeFd(stdoutFd);
@@ -415,19 +560,33 @@ export function buildAsyncRunnerSteps(id: string, params: AsyncRunnerStepBuildPa
 			...(s.reads !== undefined ? { reads: s.reads } : {}),
 			...(s.progress !== undefined ? { progress: s.progress } : {}),
 			...(stepSkillInput !== undefined ? { skills: stepSkillInput } : {}),
-			...(s.model ? { model: s.model } : {}),
+			...(s.model !== undefined ? { model: s.model } : {}),
 		};
 	};
-	const buildSeqStep = (s: SequentialStep, sessionFile?: string, behaviorCwd?: string, progressPrecreated = false, resolvedBehavior?: ResolvedStepBehavior, flatIndex?: number) => {
+	const buildSeqStep = (s: SequentialStep, sessionFile?: string, behaviorCwd?: string, progressPrecreated = false, resolvedBehavior?: ResolvedStepBehavior, flatIndex?: number, parallelOutputNamespace?: { stepIndex: number; taskIndex?: number }) => {
 		const a = agents.find((x) => x.name === s.agent)!;
 		const toolBudgetInput = s.toolBudget ?? params.toolBudget ?? a.toolBudget ?? params.configToolBudget;
 		const resolvedToolBudget = validateToolBudgetConfig(toolBudgetInput, s.toolBudget ? "toolBudget" : a.toolBudget ? "agent.toolBudget" : "config.toolBudget");
 		if (resolvedToolBudget.error) throw new AsyncStartValidationError(resolvedToolBudget.error);
 		const stepCwd = resolveChildCwd(runnerCwd, s.cwd);
 		const instructionCwd = behaviorCwd ?? stepCwd;
-		const behavior = suppressProgressForReadOnlyTask(resolvedBehavior ?? resolveStepBehavior(a, buildStepOverrides(s), chainSkills), s.task, originalTask);
+		let behavior = suppressProgressForReadOnlyTask(resolvedBehavior ?? resolveStepBehavior(a, buildStepOverrides(s), chainSkills), s.task, originalTask);
+		const inheritedRelativeParallelOutput = parallelOutputNamespace && s.output === undefined && typeof behavior.output === "string" && !path.isAbsolute(behavior.output);
+		if (inheritedRelativeParallelOutput && parallelOutputNamespace.taskIndex !== undefined) {
+			behavior = {
+				...behavior,
+				output: path.join(`parallel-${parallelOutputNamespace.stepIndex}`, `${parallelOutputNamespace.taskIndex}-${s.agent}`, behavior.output),
+			};
+		}
+		const namespaceOutputPath = Boolean(inheritedRelativeParallelOutput && parallelOutputNamespace.taskIndex === undefined);
 		const skillNames = behavior.skills === false ? [] : behavior.skills;
-		const { resolved: resolvedSkills, missing: missingSkills } = resolveSkillsWithFallback(skillNames, stepCwd, ctx.cwd);
+		const { resolved: resolvedSkills, missing: missingSkills } = resolveSkillsWithFallback(
+			skillNames,
+			stepCwd,
+			ctx.cwd,
+			a.skillPath,
+			a.filePath ? path.dirname(a.filePath) : stepCwd,
+		);
 		if (missingSkills.includes("pi-subagents")) throw new UnavailableSubagentSkillError(UNAVAILABLE_SUBAGENT_SKILL_ERROR);
 
 		let systemPrompt = a.systemPrompt?.trim() ?? "";
@@ -445,16 +604,23 @@ export function buildAsyncRunnerSteps(id: string, params: AsyncRunnerStepBuildPa
 		if (behavior.progress) progressInstructionCreated = true;
 		const progressInstructions = buildChainInstructions({ ...behavior, output: false, reads: false }, progressDir, isFirstProgressAgent);
 		const outputPath = resolveSingleOutputPath(behavior.output, ctx.cwd, instructionCwd, outputBaseDir);
-		systemPrompt = injectOutputPathSystemPrompt(systemPrompt, outputPath);
+		if (!namespaceOutputPath) systemPrompt = injectOutputPathSystemPrompt(systemPrompt, outputPath, a);
 		const validationError = validateFileOnlyOutputMode(behavior.outputMode, outputPath, `Async step (${s.agent})`);
 		if (validationError) throw new AsyncStartValidationError(validationError);
 		let taskTemplate = s.task ?? "{previous}";
 		taskTemplate = taskTemplate.replace(/\{task\}/g, originalTask ?? "");
 		taskTemplate = taskTemplate.replace(/\{chain_dir\}/g, runnerCwd);
-		const task = injectSingleOutputInstruction(`${readInstructions.prefix}${taskTemplate}${progressInstructions.suffix}`, outputPath);
+		const taskText = `${readInstructions.prefix}${taskTemplate}${progressInstructions.suffix}`;
+		const task = namespaceOutputPath ? taskText : injectSingleOutputInstruction(taskText, outputPath, a);
 
-		const requestedModel = behavior.model ?? a.model;
-		const primaryModel = resolveSubagentModelOverride(requestedModel, ctx.currentModel, availableModels, ctx.currentModelProvider, { scope: ctx.modelScope, source: behavior.model ? "explicit" : "inherited" });
+		const primaryModel = resolveEffectiveSubagentModel(
+			s.model,
+			a.model,
+			ctx.currentModel,
+			availableModels,
+			ctx.currentModelProvider,
+			{ scope: ctx.modelScope },
+		);
 		const thinkingOverride = flatIndex === undefined ? undefined : thinkingOverridesByFlatIndex?.[flatIndex];
 		const effectiveThinking = thinkingOverride ?? a.thinking;
 		const model = applyThinkingSuffix(primaryModel, effectiveThinking, thinkingOverride !== undefined);
@@ -483,17 +649,22 @@ export function buildAsyncRunnerSteps(id: string, params: AsyncRunnerStepBuildPa
 			inheritSkills: a.inheritSkills,
 			skills: resolvedSkills.map((r) => r.name),
 			outputPath,
+			...(namespaceOutputPath ? { namespaceOutputPath: true } : {}),
 			outputMode: behavior.outputMode,
 			sessionFile,
 			maxSubagentDepth: resolveChildMaxSubagentDepth(maxSubagentDepth, a.maxSubagentDepth),
+			waitToolEnabled: params.waitToolEnabled,
 			effectiveAcceptance: resolveEffectiveAcceptance({
 				explicit: s.acceptance,
 				agentName: s.agent,
-				task: s.task,
+				acceptanceRole: a.acceptanceRole,
+				task,
 				mode: resultMode,
 				async: true,
 				dynamic: false,
 			}),
+			acceptanceInput: s.acceptance,
+			acceptanceRole: a.acceptanceRole,
 			...(s.outputSchema ? { structuredOutputSchema: s.outputSchema } : {}),
 			...(s.outputSchema ? { structuredOutput: createStructuredOutputRuntime(s.outputSchema, path.join(asyncDir, "structured-output")) } : {}),
 			...(resolvedToolBudget.budget ? { toolBudget: resolvedToolBudget.budget } : {}),
@@ -536,7 +707,7 @@ export function buildAsyncRunnerSteps(id: string, params: AsyncRunnerStepBuildPa
 							}
 						}
 						const staticStep = nextFlatStep();
-						return buildSeqStep(t, staticStep.sessionFile, behaviorCwd, progressPrecreated, parallelBehaviors[taskIndex], staticStep.index);
+						return buildSeqStep(t, staticStep.sessionFile, behaviorCwd, progressPrecreated, parallelBehaviors[taskIndex], staticStep.index, { stepIndex, taskIndex });
 					}),
 					concurrency: s.concurrency,
 					failFast: s.failFast,
@@ -553,9 +724,10 @@ export function buildAsyncRunnerSteps(id: string, params: AsyncRunnerStepBuildPa
 				}
 				const maxItems = s.expand.maxItems ?? params.dynamicFanoutMaxItems ?? 0;
 				const dynamicFlatSteps = Array.from({ length: maxItems }, () => nextFlatStep());
+				const parallel = buildSeqStep(s.parallel as SequentialStep, undefined, undefined, progressPrecreated, behavior, undefined, { stepIndex });
 				return {
 					expand: s.expand,
-					parallel: buildSeqStep(s.parallel as SequentialStep, undefined, undefined, progressPrecreated, behavior),
+					parallel,
 					collect: s.collect,
 					concurrency: s.concurrency,
 					failFast: s.failFast,
@@ -566,11 +738,14 @@ export function buildAsyncRunnerSteps(id: string, params: AsyncRunnerStepBuildPa
 					effectiveAcceptance: resolveEffectiveAcceptance({
 						explicit: s.acceptance,
 						agentName: s.parallel.agent,
-						task: s.parallel.task,
+						acceptanceRole: agent.acceptanceRole,
+						task: parallel.task,
 						mode: resultMode,
 						async: true,
 						dynamicGroup: true,
 					}),
+					acceptanceInput: s.acceptance,
+					acceptanceRole: agent.acceptanceRole,
 				};
 			}
 			const staticStep = nextFlatStep();
@@ -592,6 +767,19 @@ export function buildAsyncRunnerSteps(id: string, params: AsyncRunnerStepBuildPa
 					inheritSkills: false,
 				}, ...builtSteps]
 			: builtSteps;
+		for (const step of steps) {
+			if (!("parallel" in step) || !Array.isArray(step.parallel)) continue;
+			const seen = new Map<string, { index: number; agent: string }>();
+			for (let index = 0; index < step.parallel.length; index++) {
+				const task = step.parallel[index]!;
+				if (!task.outputPath) continue;
+				const previous = seen.get(task.outputPath);
+				if (previous) {
+					throw new AsyncStartValidationError(`Parallel tasks ${previous.index + 1} (${previous.agent}) and ${index + 1} (${task.agent}) resolve output to the same path: ${task.outputPath}. Use distinct output paths.`);
+				}
+				seen.set(task.outputPath, { index, agent: task.agent });
+			}
+		}
 		return { steps, runnerCwd, workflowGraph, eventChain: graphChain, ...(originalTask !== undefined ? { originalTask } : {}) };
 	} catch (error) {
 		if (error instanceof UnavailableSubagentSkillError || error instanceof AsyncStartValidationError) return { error: error.message };
@@ -660,6 +848,7 @@ export function executeAsyncChain(
 		outputBaseDir: artifactsDir ? path.join(artifactsDir, "outputs", id) : undefined,
 		dynamicFanoutMaxItems: params.dynamicFanoutMaxItems,
 		maxSubagentDepth,
+		waitToolEnabled: params.waitToolEnabled,
 		worktreeBaseDir,
 		asyncDir,
 		toolBudget: params.toolBudget,
@@ -751,6 +940,12 @@ export function executeAsyncChain(
 			: isDynamicParallelStep(eventFirstStep)
 				? [eventFirstStep.parallel.agent]
 			: [(eventFirstStep as SequentialStep).agent];
+		const firstTask = isParallelStep(eventFirstStep)
+			? eventFirstStep.parallel[0]?.task
+			: isDynamicParallelStep(eventFirstStep)
+				? eventFirstStep.parallel.task
+				: (eventFirstStep as SequentialStep).task;
+		const workflowGoal = params.goal ?? (params.task?.trim() || firstTask);
 		const parallelGroups: Array<{ start: number; count: number; stepIndex: number }> = [];
 		const flatAgents: string[] = [];
 		let flatStepStart = 0;
@@ -813,11 +1008,8 @@ export function executeAsyncChain(
 			mode: resultMode,
 			agent: firstAgents[0],
 			agents: flatAgents,
-			task: isParallelStep(eventFirstStep)
-				? eventFirstStep.parallel[0]?.task?.slice(0, 50)
-				: isDynamicParallelStep(eventFirstStep)
-					? eventFirstStep.parallel.task?.slice(0, 50)
-				: (eventFirstStep as SequentialStep).task?.slice(0, 50),
+			task: firstTask?.slice(0, 50),
+			goal: workflowGoal?.slice(0, 120),
 			chain: eventChain.map((s) =>
 				isParallelStep(s) ? `[${s.parallel.map((t) => t.agent).join("+")}]` : isDynamicParallelStep(s) ? `expand:${s.parallel.agent}` : (s as SequentialStep).agent,
 			),
@@ -839,7 +1031,7 @@ export function executeAsyncChain(
 		.join(" -> ");
 
 	return {
-		content: [{ type: "text", text: formatAsyncStartedMessage(`Async ${resultMode}: ${chainDesc} [${id}]`) }],
+		content: [{ type: "text", text: formatAsyncStartedMessage(`Async ${resultMode}: ${chainDesc} [${id}]`, ctx.interactive === true) }],
 		details: { mode: resultMode, runId: id, results: [], asyncId: id, asyncDir, workflowGraph, ...(params.timeoutMs !== undefined ? { timeoutMs: params.timeoutMs, deadlineAt } : {}), ...(params.turnBudget ? { turnBudget: params.turnBudget } : {}), ...(params.toolBudget ? { toolBudget: params.toolBudget } : {}) },
 	};
 }
@@ -875,7 +1067,13 @@ export function executeAsyncSingle(
 	const runnerCwd = resolveChildCwd(ctx.cwd, cwd);
 	const skillNames = params.skills ?? agentConfig.skills ?? [];
 	const availableModels = params.availableModels;
-	const { resolved: resolvedSkills, missing: missingSkills } = resolveSkillsWithFallback(skillNames, runnerCwd, ctx.cwd);
+	const { resolved: resolvedSkills, missing: missingSkills } = resolveSkillsWithFallback(
+		skillNames,
+		runnerCwd,
+		ctx.cwd,
+		agentConfig.skillPath,
+		agentConfig.filePath ? path.dirname(agentConfig.filePath) : runnerCwd,
+	);
 	if (missingSkills.includes("pi-subagents")) return formatAsyncStartError("single", UNAVAILABLE_SUBAGENT_SKILL_ERROR);
 	let systemPrompt = agentConfig.systemPrompt?.trim() ?? "";
 	if (resolvedSkills.length > 0) {
@@ -905,11 +1103,11 @@ export function executeAsyncSingle(
 
 	const effectiveOutput = normalizeSingleOutputOverride(params.output, agentConfig.output);
 	const outputPath = resolveSingleOutputPath(effectiveOutput, ctx.cwd, runnerCwd, params.outputBaseDir ?? (artifactsDir ? path.join(artifactsDir, "outputs", id) : undefined));
-	systemPrompt = injectOutputPathSystemPrompt(systemPrompt, outputPath);
+	systemPrompt = injectOutputPathSystemPrompt(systemPrompt, outputPath, agentConfig);
 	const outputMode = params.outputMode ?? "inline";
 	const validationError = validateFileOnlyOutputMode(outputMode, outputPath, `Async single run (${agent})`);
 	if (validationError) return formatAsyncStartError("single", validationError);
-	const taskWithOutputInstruction = injectSingleOutputInstruction(task, outputPath);
+	const taskWithOutputInstruction = injectSingleOutputInstruction(task, outputPath, agentConfig);
 	const primaryModel = resolveSubagentModelOverride(
 		params.modelOverride ?? agentConfig.model,
 		ctx.currentModel,
@@ -921,8 +1119,62 @@ export function executeAsyncSingle(
 	const toolBudgetInput = params.toolBudget ?? agentConfig.toolBudget ?? params.configToolBudget;
 	const resolvedToolBudget = validateToolBudgetConfig(toolBudgetInput, params.toolBudget ? "toolBudget" : agentConfig.toolBudget ? "agent.toolBudget" : "config.toolBudget");
 	if (resolvedToolBudget.error) return formatAsyncStartError("single", resolvedToolBudget.error);
-	const deadlineAt = params.timeoutMs !== undefined ? Date.now() + params.timeoutMs : undefined;
+	const deadlineAt = params.absoluteDeadlineAt ?? (params.timeoutMs !== undefined ? Date.now() + params.timeoutMs : undefined);
+	const timeoutMs = params.absoluteDeadlineAt !== undefined && deadlineAt !== undefined
+		? deadlineAt - Date.now()
+		: params.timeoutMs;
+	if (timeoutMs !== undefined && timeoutMs <= 0) return formatAsyncStartError("single", "The source run's absolute deadline expired before recovery could launch.");
 	const initialTurnBudget = params.turnBudget ? initialTurnBudgetState(params.turnBudget) : undefined;
+	const resolvedSessionDir = params.sessionDir ?? (sessionRoot ? path.join(sessionRoot, `async-${id}`) : undefined);
+	const resolvedAcceptance = resolveEffectiveAcceptance({
+		explicit: params.acceptance,
+		agentName: agent,
+		acceptanceRole: agentConfig.acceptanceRole,
+		task,
+		mode: "single",
+		async: true,
+	});
+	const recoveryDescriptor: SteeringRecoveryDescriptor = {
+		version: 1,
+		sourceRunId: id,
+		agent,
+		...(sessionFile ? { sessionFile } : {}),
+		cwd: runnerCwd,
+		...(model ? { model } : {}),
+		...(agentConfig.fallbackModels ? { fallbackModels: [...agentConfig.fallbackModels] } : {}),
+		...(effectiveThinking ? { thinking: resolveEffectiveThinking(model, effectiveThinking) } : {}),
+		...(agentConfig.tools ? { tools: [...agentConfig.tools] } : {}),
+		...(agentConfig.extensions ? { extensions: [...agentConfig.extensions] } : {}),
+		...(agentConfig.subagentOnlyExtensions ? { subagentOnlyExtensions: [...agentConfig.subagentOnlyExtensions] } : {}),
+		...(agentConfig.mcpDirectTools ? { mcpDirectTools: [...agentConfig.mcpDirectTools] } : {}),
+		...(agentConfig.systemPrompt ? { systemPrompt: agentConfig.systemPrompt } : {}),
+		systemPromptMode: agentConfig.systemPromptMode,
+		inheritProjectContext: agentConfig.inheritProjectContext,
+		inheritSkills: agentConfig.inheritSkills,
+		...(resolvedSkills.length ? { skills: resolvedSkills.map((skill) => skill.name) } : {}),
+		...(agentConfig.skillPath ? { skillPath: [...agentConfig.skillPath] } : {}),
+		...(agentConfig.filePath ? { agentFilePath: agentConfig.filePath } : {}),
+		...(agentConfig.completionGuard !== undefined ? { completionGuard: agentConfig.completionGuard } : {}),
+		...(agentConfig.memory ? { memory: { ...agentConfig.memory } } : {}),
+		...(outputPath ? { outputPath } : {}),
+		outputMode,
+		...(resolvedAcceptance ? { acceptance: resolvedAcceptance } : {}),
+		...(controlConfig ? { controlConfig } : {}),
+		...(deadlineAt !== undefined ? { absoluteDeadlineAt: deadlineAt } : {}),
+		...(params.turnBudget ? { initialTurnBudget: params.turnBudget } : {}),
+		...(resolvedToolBudget.budget ? { initialToolBudget: resolvedToolBudget.budget } : {}),
+		maxSubagentDepth: resolveChildMaxSubagentDepth(maxSubagentDepth, agentConfig.maxSubagentDepth),
+		...(maxOutput ? { maxOutput } : {}),
+		share: shareEnabled,
+		...(resolvedSessionDir ? { sessionDir: resolvedSessionDir } : {}),
+		...(artifactsDir ? { artifactsDir } : {}),
+		artifactConfig,
+	};
+	try {
+		writePrivateAtomicJson(path.join(asyncDir, "recovery-descriptor.json"), recoveryDescriptor);
+	} catch (error) {
+		return formatAsyncStartError("single", `Failed to persist async recovery descriptor for '${id}': ${error instanceof Error ? error.message : String(error)}`);
+	}
 	let spawnResult: { pid?: number; error?: string } = {};
 	try {
 		spawnResult = spawnRunner(
@@ -953,13 +1205,8 @@ export function executeAsyncSingle(
 						outputMode,
 						sessionFile,
 						maxSubagentDepth: resolveChildMaxSubagentDepth(maxSubagentDepth, agentConfig.maxSubagentDepth),
-						effectiveAcceptance: resolveEffectiveAcceptance({
-							explicit: params.acceptance,
-							agentName: agent,
-							task,
-							mode: "single",
-							async: true,
-						}),
+						waitToolEnabled: params.waitToolEnabled,
+						effectiveAcceptance: resolvedAcceptance,
 						...(resolvedToolBudget.budget ? { toolBudget: resolvedToolBudget.budget } : {}),
 					},
 				],
@@ -970,7 +1217,7 @@ export function executeAsyncSingle(
 				artifactsDir: artifactConfig.enabled ? artifactsDir : undefined,
 				artifactConfig,
 				share: shareEnabled,
-				sessionDir: sessionRoot ? path.join(sessionRoot, `async-${id}`) : undefined,
+				sessionDir: resolvedSessionDir,
 				asyncDir,
 				sessionId: ctx.currentSessionId,
 				piPackageRoot,
@@ -979,13 +1226,14 @@ export function executeAsyncSingle(
 				worktreeSetupHookTimeoutMs,
 				worktreeBaseDir,
 				controlConfig,
-				timeoutMs: params.timeoutMs,
+				timeoutMs,
 				deadlineAt,
 				turnBudget: params.turnBudget,
 				toolBudget: params.toolBudget,
 				controlIntercomTarget,
 				childIntercomTargets: childIntercomTarget ? [childIntercomTarget(agent, 0)] : undefined,
 				resultMode: "single",
+				...(params.revivalLease ? { revivalLease: params.revivalLease } : {}),
 				nestedRoute: nestedRoute ?? inheritedNestedRoute,
 				nestedSelf: inheritedNestedRoute && nestedAddress ? {
 					parentRunId: nestedAddress.parentRunId,
@@ -1032,7 +1280,7 @@ export function executeAsyncSingle(
 						agent,
 						agents: [agent],
 						chainStepCount: 1,
-						...(params.timeoutMs !== undefined ? { timeoutMs: params.timeoutMs, deadlineAt } : {}),
+						...(timeoutMs !== undefined ? { timeoutMs, deadlineAt } : {}),
 						...(initialTurnBudget ? { turnBudget: initialTurnBudget } : {}),
 						startedAt: now,
 						lastUpdate: now,
@@ -1050,16 +1298,17 @@ export function executeAsyncSingle(
 			mode: "single",
 			agent,
 			task: task?.slice(0, 50),
+			goal: (params.goal ?? task).slice(0, 120),
 			cwd: runnerCwd,
 			asyncDir,
-			...(params.timeoutMs !== undefined ? { timeoutMs: params.timeoutMs, deadlineAt } : {}),
+			...(timeoutMs !== undefined ? { timeoutMs, deadlineAt } : {}),
 			...(initialTurnBudget ? { turnBudget: initialTurnBudget } : {}),
 			nestedRoute,
 		});
 	}
 
 	return {
-		content: [{ type: "text", text: formatAsyncStartedMessage(`Async: ${agent} [${id}]`) }],
-		details: { mode: "single", runId: id, results: [], asyncId: id, asyncDir, ...(params.timeoutMs !== undefined ? { timeoutMs: params.timeoutMs, deadlineAt } : {}), ...(params.turnBudget ? { turnBudget: params.turnBudget } : {}), ...(params.toolBudget ? { toolBudget: params.toolBudget } : {}) },
+		content: [{ type: "text", text: formatAsyncStartedMessage(`Async: ${agent} [${id}]`, ctx.interactive === true) }],
+		details: { mode: "single", runId: id, results: [], asyncId: id, asyncDir, ...(timeoutMs !== undefined ? { timeoutMs, deadlineAt } : {}), ...(params.turnBudget ? { turnBudget: params.turnBudget } : {}), ...(params.toolBudget ? { toolBudget: params.toolBudget } : {}) },
 	};
 }
