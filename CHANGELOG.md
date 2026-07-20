@@ -2,6 +2,11 @@
 
 ## [Unreleased]
 
+### Fixed
+- Upgraded the fork baseline to v0.35.1 so Azure/OpenAI fork-context children retain configured thinking after inherited Anthropic signed-thinking blocks are sanitized; added an exact `bluebox-azure-openai/gpt-5_6-luna:high` regression.
+- Kept successful child runs tolerant of recoverable trailing tool errors only after a standalone assistant answer; tool-use preambles no longer mask terminal tool failures.
+- Preserved unrelated subagent settings across profile switches and validated profile `thinking`, `fallbackModels`, and `disableBuiltins` fields.
+
 ## [0.35.1] - 2026-07-17
 
 ### Fixed

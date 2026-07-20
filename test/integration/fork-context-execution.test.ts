@@ -460,7 +460,7 @@ describe("fork context execution wiring", { skip: !available ? "subagent executo
 		assert.deepEqual(modelArgs, ["openai/gpt-5-mini:off", "anthropic/claude-sonnet-4:off"]);
 	});
 
-	it("keeps requested thinking for non-Anthropic forked children without Anthropic fallbacks", async () => {
+	it("keeps high thinking for the Azure fallback worker in fork context", async () => {
 		mockPi.reset();
 		mockPi.onCall({ output: "done" });
 		const parentSessionFile = path.join(tempDir, "parent.jsonl");
@@ -482,7 +482,7 @@ describe("fork context execution wiring", { skip: !available ? "subagent executo
 		};
 		const executor = makeExecutorWithDiscoverAgents(() => ({
 			agents: [
-				{ name: "worker", description: "Worker", defaultContext: "fork", model: "openai/gpt-5-mini:high", thinking: "high" },
+				{ name: "worker", description: "Worker", defaultContext: "fork", model: "bluebox-azure-openai/gpt-5_6-luna:high", thinking: "high" },
 			],
 			projectAgentsDir: null,
 		}));
@@ -490,7 +490,7 @@ describe("fork context execution wiring", { skip: !available ? "subagent executo
 		const ctx = {
 			...makeCtx(manager),
 			modelRegistry: {
-				getAvailable: () => [{ provider: "openai", id: "gpt-5-mini", api: "openai-responses", reasoning: true }],
+				getAvailable: () => [{ provider: "bluebox-azure-openai", id: "gpt-5_6-luna", api: "azure-openai-responses", reasoning: true }],
 			},
 		};
 		const result = await executor.execute(
@@ -503,7 +503,7 @@ describe("fork context execution wiring", { skip: !available ? "subagent executo
 
 		assert.equal(result.isError, undefined);
 		const args = readCallArgs();
-		assert.equal(args[args.indexOf("--model") + 1], "openai/gpt-5-mini:high");
+		assert.equal(args[args.indexOf("--model") + 1], "bluebox-azure-openai/gpt-5_6-luna:high");
 		const entries = fs.readFileSync(childSessionFile, "utf-8").trim().split("\n").map((line) => JSON.parse(line));
 		assert.deepEqual(entries[1].message.content, [{ type: "text", text: "answer" }]);
 		assert.equal(entries.length, 2);
